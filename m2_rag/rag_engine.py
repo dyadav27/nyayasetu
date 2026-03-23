@@ -1,0 +1,285 @@
+"""
+M2 — RAG Engine: Query + Generation  [GPU-ACCELERATED]
+Nyaya-Setu | Team IKS | SPIT CSE 2025-26
+
+GPU usage:
+  - Bi-encoder  (MiniLM)      → RTX 4050  ~90 MB VRAM
+  - Cross-encoder (ms-marco)  → RTX 4050  ~90 MB VRAM
+  - Llama-3 8B (4-bit)        → RTX 4050  ~4.5 GB VRAM via Ollama
+
+IMPORTANT: Set these two paths to your local model folders before running.
+"""
+
+import os, sys, json, re
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
+from PIL.ImagePalette import raw
+import chromadb
+import numpy as np
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from rank_bm25 import BM25Okapi
+from pydantic import BaseModel, Field
+import ollama
+from dotenv import load_dotenv
+from gpu_utils import DEVICE, print_gpu_status, clear_gpu_cache
+
+load_dotenv()
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+# UPDATE THESE TWO PATHS to match your local cache folder
+EMBED_MODEL  = r"C:\Users\Nitin Sharma\.cache\huggingface\hub\models--sentence-transformers--all-MiniLM-L6-v2\snapshots\8b3219a92973c328a8e22fadcfa821b5dc75636a"
+RERANK_MODEL = r"C:\Users\Nitin Sharma\.cache\huggingface\hub\models--cross-encoder--ms-marco-MiniLM-L-6-v2\snapshots\main"
+
+CHROMA_DIR      = "data/chromadb"
+COLLECTION      = "nyayasetu_legal"
+RETRIEVAL_TOP_K = 20
+RERANK_TOP_N    = 3
+OLLAMA_MODEL    = "llama3"
+
+
+# ── Pydantic output schema ─────────────────────────────────────────────────────
+class FIRComplaint(BaseModel):
+    complainant_name:       str
+    incident_description:   str
+    applicable_sections:    list[str]
+    section_explanations:   list[str]
+    relief_sought:          str
+    recommended_next_steps: list[str]
+    legal_disclaimer:       str = (
+        "This is an AI-generated legal triage. "
+        "Consult a qualified advocate before filing."
+    )
+
+
+# ── RAG Engine ─────────────────────────────────────────────────────────────────
+class NyayaSetuRAG:
+
+    def __init__(self):
+        # Bi-encoder on GPU
+        print(f"[RAG] Loading bi-encoder on {DEVICE}...")
+        self.embedder = SentenceTransformer(EMBED_MODEL, device=str(DEVICE))
+        print_gpu_status("bi-encoder loaded")
+
+        # Cross-encoder on GPU
+        print(f"[RAG] Loading cross-encoder on {DEVICE}...")
+        import torch
+        torch.cuda.set_device(DEVICE)
+        self.reranker = CrossEncoder(RERANK_MODEL, max_length=512, device=str(DEVICE))
+        print_gpu_status("cross-encoder loaded")
+
+        # ChromaDB
+        print("[RAG] Connecting to ChromaDB...")
+        self.client     = chromadb.PersistentClient(path=CHROMA_DIR)
+        self.collection = self.client.get_collection(COLLECTION)
+        print(f"[RAG] ChromaDB docs: {self.collection.count()}")
+
+        # BM25
+        print("[RAG] Building BM25 index in RAM...")
+        self._build_bm25()
+
+        # Ollama
+        print(f"[RAG] Ollama LLM: {OLLAMA_MODEL} (GPU via Ollama)")
+        self._verify_ollama()
+
+    def _build_bm25(self):
+        result          = self.collection.get(include=["documents", "metadatas"])
+        self._all_docs  = result["documents"]
+        self._all_ids   = result["ids"]
+        self._all_metas = result["metadatas"]
+        tokenized       = [d.lower().split() for d in self._all_docs]
+        self.bm25       = BM25Okapi(tokenized)
+        print(f"[RAG] BM25 index: {len(self._all_docs)} docs")
+
+    def _verify_ollama(self):
+        try:
+            response = ollama.list()
+            # handle both old and new ollama API formats
+            models_data = response.get("models", []) if isinstance(response, dict) else []
+            model_names = []
+            for m in models_data:
+                if isinstance(m, dict):
+                    model_names.append(m.get("name", "") or m.get("model", ""))
+                else:
+                    model_names.append(str(m))
+            if any(OLLAMA_MODEL in n for n in model_names):
+                print(f"[RAG] ✅ Ollama model '{OLLAMA_MODEL}' ready on GPU.")
+            else:
+                print(f"[RAG] ⚠️  Model not confirmed. Will try anyway.")
+        except Exception as e:
+            print(f"[RAG] ⚠️  Ollama check failed: {e} — will try anyway.")
+
+    def _hybrid_retrieve(self, query: str) -> list[dict]:
+        # Semantic search on GPU
+        q_emb = self.embedder.encode(
+            [query],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        ).tolist()
+
+        sem = self.collection.query(
+            query_embeddings=q_emb,
+            n_results=min(RETRIEVAL_TOP_K, self.collection.count()),
+            include=["documents", "metadatas", "distances"],
+        )
+        sem_docs   = sem["documents"][0]
+        sem_ids    = sem["ids"][0]
+        sem_metas  = sem["metadatas"][0]
+        sem_scores = [1 - d for d in sem["distances"][0]]
+
+        # BM25 keyword search on CPU
+        bm25_all  = self.bm25.get_scores(query.lower().split())
+        top_idx   = np.argsort(bm25_all)[::-1][:RETRIEVAL_TOP_K]
+        bm25_max  = bm25_all[top_idx[0]] if bm25_all[top_idx[0]] > 0 else 1.0
+        bm25_hits = {self._all_ids[i]: bm25_all[i] / bm25_max for i in top_idx}
+
+        # Merge scores
+        merged = {}
+        for i, did in enumerate(sem_ids):
+            merged[did] = {
+                "text":     sem_docs[i],
+                "metadata": sem_metas[i],
+                "score":    0.5 * sem_scores[i] + 0.5 * bm25_hits.get(did, 0.0),
+            }
+        for did, bm_score in bm25_hits.items():
+            if did not in merged:
+                idx = self._all_ids.index(did)
+                merged[did] = {
+                    "text":     self._all_docs[idx],
+                    "metadata": self._all_metas[idx],
+                    "score":    0.5 * bm_score,
+                }
+
+        return sorted(merged.values(), key=lambda x: x["score"], reverse=True)[:RETRIEVAL_TOP_K]
+
+    def _rerank(self, query: str, candidates: list[dict]) -> list[dict]:
+        pairs  = [(query, c["text"]) for c in candidates]
+        scores = self.reranker.predict(pairs, show_progress_bar=False)
+        for i, c in enumerate(candidates):
+            c["rerank_score"] = float(scores[i])
+        return sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)[:RERANK_TOP_N]
+
+    def _build_prompt(self, query: str, chunks: list[dict]) -> str:
+        ctx = "\n\n---\n\n".join(
+            f"[Source {i+1}: {c['metadata'].get('act','')} | p.{c['metadata'].get('page','')}]\n{c['text']}"
+            for i, c in enumerate(chunks)
+        )
+        return f"""You are Nyaya-Setu, an Indian legal assistant. Answer using ONLY the context below.
+
+STRICT RULES:
+1. Use ONLY information from the CONTEXT. Never invent section numbers.
+2. Cite exact Act name and section number from context.
+3. Write in simple language a non-lawyer understands.
+4. Output ONLY a raw JSON object. No explanation, no markdown, no code fences.
+5. Start your response with {{ and end with }}. Nothing before or after.
+
+CONTEXT:
+{ctx}
+
+QUERY: {query}
+
+Output this exact JSON structure with all fields filled:
+{{
+  "complainant_name": "Unknown (to be filled by user)",
+  "incident_description": "describe the incident from the query in 1-2 sentences",
+  "applicable_sections": ["Act Name Section Number"],
+  "section_explanations": ["plain English explanation of each section"],
+  "relief_sought": "what the complainant wants police to do",
+  "recommended_next_steps": ["Step 1: go to nearest police station", "Step 2: bring ID proof and evidence"],
+  "legal_disclaimer": "This is an AI-generated legal triage. Consult a qualified advocate before filing."
+}}"""
+
+    def _call_llm(self, prompt: str) -> str:
+        response = ollama.chat(
+            model=OLLAMA_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={
+                "temperature": 0.0,   # fully deterministic
+                "num_ctx":     4096,
+                "num_gpu":     99,    # all layers on RTX 4050
+                "num_thread":  4,
+            },
+        )
+        return response["message"]["content"]
+
+    def _parse(self, raw: str, complainant_name: str) -> FIRComplaint:
+        # Clean up common LLM formatting issues
+        raw = re.sub(r"```json\s*", "", raw)
+        raw = re.sub(r"```\s*",     "", raw)
+        raw = raw.strip()
+
+        # Extract JSON object if there's extra text around it
+        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if json_match:
+            raw = json_match.group(0)
+
+        # Fix trailing commas (common LLM mistake)
+        raw = re.sub(r',\s*}', '}', raw)
+        raw = re.sub(r',\s*]', ']', raw)
+
+        # Fix unescaped quotes inside strings (basic fix)
+        try:
+            data = json.loads(raw)
+            if complainant_name != "Unknown":
+                data["complainant_name"] = complainant_name
+            return FIRComplaint(**data)
+        except Exception as e:
+            print(f"[WARN] JSON parse failed: {e}")
+            print(f"[WARN] Raw response was:\n{raw[:300]}")
+            # Try to extract useful info even from broken JSON
+            sections = re.findall(r'"([A-Z][^"]*Section[^"]*)"', raw)
+            steps    = re.findall(r'"(Step \d+[^"]*)"', raw)
+            return FIRComplaint(
+                complainant_name=complainant_name,
+                incident_description=query if hasattr(self, '_last_query') else "See raw response",
+                applicable_sections=sections if sections else ["Could not parse — please retry"],
+                section_explanations=["Response parsing failed — check raw output above"],
+                relief_sought="File complaint at nearest police station",
+                recommended_next_steps=steps if steps else ["Step 1: Visit nearest police station with your ID"],
+            )
+
+    def query(self, user_query: str, complainant_name: str = "Unknown") -> FIRComplaint:
+        self._last_query = user_query
+        print(f"\n[RAG] Query: {user_query[:80]}")
+
+        candidates = self._hybrid_retrieve(user_query)
+        print(f"[RAG] Stage1: {len(candidates)} candidates")
+
+        top_chunks = self._rerank(user_query, candidates)
+        print("[RAG] Stage2 top chunks:")
+        for i, c in enumerate(top_chunks):
+            m = c["metadata"]
+            print(f"  [{i+1}] {m.get('act','')} p.{m.get('page','')} rerank={c['rerank_score']:.3f}")
+
+        print_gpu_status("before LLM call")
+        prompt = self._build_prompt(user_query, top_chunks)
+        raw    = self._call_llm(prompt)
+        print(f"[RAG] LLM response: {len(raw)} chars")
+        print(f"[RAG] Raw LLM output: {raw}")
+
+        return self._parse(raw, complainant_name)
+
+
+# ── Singleton ──────────────────────────────────────────────────────────────────
+_instance = None
+def get_rag_engine() -> NyayaSetuRAG:
+    global _instance
+    if _instance is None:
+        _instance = NyayaSetuRAG()
+    return _instance
+
+
+# ── CLI test ───────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    rag = get_rag_engine()
+    tests = [
+        "My phone was snatched by two men on a bike near Andheri station.",
+        "Someone is sending me threatening WhatsApp messages and demanding money.",
+        "My landlord has locked my flat without notice and kept my belongings.",
+    ]
+    for q in tests:
+        r = rag.query(q)
+        print(f"\n{'='*55}")
+        print(f"Q: {q}")
+        print(f"Sections: {r.applicable_sections}")
+        print(f"Steps:    {r.recommended_next_steps[:2]}")
+        print(f"Relief:   {r.relief_sought}")

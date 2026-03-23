@@ -1,0 +1,30 @@
+# Nyaya-Setu — Git ignore
+
+# Environment
+.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Data (too large for git)
+data/chromadb/
+data/statutes/*.pdf
+
+# Generated files
+/tmp/*.pdf
+/tmp/*.wav
+/tmp/*.ogg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+uvicorn.log
