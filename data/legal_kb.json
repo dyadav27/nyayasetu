@@ -1,0 +1,281 @@
+{
+  "version": "1.0",
+  "source": "Bharatiya Nyaya Sanhita 2023 / BNSS 2023 / BSA 2023",
+  "offences": [
+
+    {
+      "id": "theft_simple",
+      "category": "theft",
+      "keywords": ["theft", "stolen", "stole", "took", "missing", "pickpocket", "pocket"],
+      "bns_section": "BNS Section 303(2)",
+      "offence_name": "Theft",
+      "description": "Dishonest taking of movable property without consent",
+      "punishment": "Up to 3 years imprisonment + fine",
+      "cognizable": true,
+      "bailable": true,
+      "triable_by": "Any Magistrate",
+      "compoundable": false,
+      "case_strength_factors": ["Was it witnessed?", "Is there CCTV?", "Value of stolen property", "Known accused or unknown"]
+    },
+
+    {
+      "id": "theft_snatching",
+      "category": "theft",
+      "keywords": ["snatched", "snatch", "grabbed", "pulled", "chain snatching", "phone snatched", "bag snatched"],
+      "bns_section": "BNS Section 304",
+      "offence_name": "Snatching",
+      "description": "Suddenly or quickly taking property from a person — specifically defined as a separate offence under BNS 2023 (was not separate under IPC)",
+      "punishment": "Up to 3 years imprisonment + fine. If hurt caused: up to 7 years",
+      "cognizable": true,
+      "bailable": true,
+      "triable_by": "Magistrate First Class",
+      "compoundable": false,
+      "case_strength_factors": ["Physical injury caused?", "More than one accused?", "Witnesses present?", "CCTV available?"]
+    },
+
+    {
+      "id": "robbery",
+      "category": "theft",
+      "keywords": ["robbery", "robbed", "armed", "weapon", "knife", "threatened and took", "loot"],
+      "bns_section": "BNS Section 309",
+      "offence_name": "Robbery",
+      "description": "Theft combined with use of force, threat of harm, or causing hurt before or during taking property",
+      "punishment": "Up to 10 years rigorous imprisonment + fine",
+      "cognizable": true,
+      "bailable": false,
+      "triable_by": "Sessions Court",
+      "compoundable": false,
+      "case_strength_factors": ["Weapon used?", "Injury caused?", "Number of accused", "Value of property"]
+    },
+
+    {
+      "id": "dacoity",
+      "category": "theft",
+      "keywords": ["dacoity", "gang", "five or more", "looted by group", "group robbery"],
+      "bns_section": "BNS Section 310",
+      "offence_name": "Dacoity",
+      "description": "Robbery committed by 5 or more persons",
+      "punishment": "Up to 10 years rigorous imprisonment or life imprisonment + fine",
+      "cognizable": true,
+      "bailable": false,
+      "triable_by": "Sessions Court",
+      "compoundable": false,
+      "case_strength_factors": ["Number of accused confirmed?", "Weapons used?", "Injury caused?"]
+    },
+
+    {
+      "id": "assault_simple",
+      "category": "assault",
+      "keywords": ["hit", "slapped", "punched", "beat", "assault", "attacked", "pushed", "kicked", "hurt"],
+      "bns_section": "BNS Section 115",
+      "offence_name": "Voluntarily causing hurt",
+      "description": "Intentionally causing bodily pain or disease to another person",
+      "punishment": "Up to 1 year imprisonment OR fine up to Rs 10,000 OR both",
+      "cognizable": false,
+      "bailable": true,
+      "triable_by": "Any Magistrate",
+      "compoundable": true,
+      "case_strength_factors": ["Medical report obtained?", "Witnesses present?", "Marks of injury visible?", "Prior enmity?"]
+    },
+
+    {
+      "id": "assault_grievous",
+      "category": "assault",
+      "keywords": ["fracture", "broken bone", "grievous", "permanent injury", "lost eye", "lost limb", "disfigured", "severe injury", "hospitalized"],
+      "bns_section": "BNS Section 117",
+      "offence_name": "Voluntarily causing grievous hurt",
+      "description": "Causing serious permanent injury — fractures, loss of limb/eye, permanent disfigurement, or endangering life",
+      "punishment": "Up to 7 years rigorous imprisonment + fine",
+      "cognizable": true,
+      "bailable": false,
+      "triable_by": "Magistrate First Class",
+      "compoundable": false,
+      "case_strength_factors": ["Medical certificate confirming grievous hurt?", "Type of injury", "Weapon used?", "Premeditated or sudden?"]
+    },
+
+    {
+      "id": "assault_with_weapon",
+      "category": "assault",
+      "keywords": ["knife", "rod", "stick", "weapon", "acid", "shot", "fired", "gun", "stabbed", "cut"],
+      "bns_section": "BNS Section 118",
+      "offence_name": "Voluntarily causing grievous hurt by dangerous weapons",
+      "description": "Using a deadly weapon — knife, acid, firearm, etc. — to cause hurt",
+      "punishment": "Life imprisonment OR up to 10 years rigorous imprisonment + fine",
+      "cognizable": true,
+      "bailable": false,
+      "triable_by": "Sessions Court",
+      "compoundable": false,
+      "case_strength_factors": ["Weapon seized?", "Nature of injuries", "Medical report", "CCTV or witnesses?"]
+    },
+
+    {
+      "id": "cybercrime_threatening",
+      "category": "cybercrime",
+      "keywords": ["threatening message", "whatsapp threat", "online threat", "message threat", "email threat", "intimidate", "extort online", "blackmail"],
+      "bns_section": "BNS Section 351",
+      "offence_name": "Criminal Intimidation",
+      "description": "Threatening someone with injury to their person, property or reputation to cause alarm or compel an act",
+      "punishment": "Up to 2 years imprisonment OR fine OR both. If threat to cause death/grievous hurt: up to 7 years",
+      "cognizable": false,
+      "bailable": true,
+      "triable_by": "Any Magistrate",
+      "compoundable": false,
+      "case_strength_factors": ["Screenshots of messages saved?", "Sender identified?", "Pattern of harassment?", "Demands made?"]
+    },
+
+    {
+      "id": "cybercrime_extortion",
+      "category": "cybercrime",
+      "keywords": ["extortion", "demanding money", "pay or else", "blackmail", "ransom", "threatened to share photos", "nude photos threat"],
+      "bns_section": "BNS Section 308",
+      "offence_name": "Extortion",
+      "description": "Intentionally putting a person in fear to dishonestly induce them to deliver property or valuable security",
+      "punishment": "Up to 3 years imprisonment + fine. If threat to cause death: up to 10 years",
+      "cognizable": true,
+      "bailable": false,
+      "triable_by": "Magistrate First Class",
+      "compoundable": false,
+      "case_strength_factors": ["Evidence of demand (messages, recordings)?", "Has money been paid?", "Accused identified?", "Nature of threat?"]
+    },
+
+    {
+      "id": "cybercrime_fraud",
+      "category": "cybercrime",
+      "keywords": ["online fraud", "cheated online", "fake website", "upi fraud", "otp fraud", "account hacked", "money transferred", "scammed", "fake call"],
+      "bns_section": "BNS Section 318",
+      "offence_name": "Cheating",
+      "description": "Deceiving a person to dishonestly induce them to deliver property or cause damage",
+      "punishment": "Up to 3 years imprisonment OR fine OR both. If cheating involves life/property endangerment: up to 7 years",
+      "cognizable": false,
+      "bailable": true,
+      "triable_by": "Magistrate First Class",
+      "compoundable": true,
+      "case_strength_factors": ["Bank transaction records available?", "Accused identity known?", "Amount involved?", "OTP shared voluntarily?"]
+    },
+
+    {
+      "id": "cybercrime_identity",
+      "category": "cybercrime",
+      "keywords": ["fake profile", "impersonation", "fake account", "someone using my name", "identity theft", "morphed photo"],
+      "bns_section": "BNS Section 319",
+      "offence_name": "Cheating by impersonation",
+      "description": "Cheating by pretending to be another person — including online impersonation",
+      "punishment": "Up to 5 years imprisonment + fine",
+      "cognizable": false,
+      "bailable": true,
+      "triable_by": "Magistrate First Class",
+      "compoundable": false,
+      "case_strength_factors": ["Screenshot of fake profile?", "Platform reported?", "Financial loss caused?", "Accused identity traced?"]
+    },
+
+    {
+      "id": "domestic_violence_cruelty",
+      "category": "domestic_violence",
+      "keywords": ["husband", "wife", "domestic", "in-laws", "dowry", "marital", "beaten by husband", "torture at home", "family violence"],
+      "bns_section": "BNS Section 85",
+      "offence_name": "Cruelty by husband or his relatives",
+      "description": "Willful conduct causing grave injury or danger to life, health or limb, or harassment for dowry demand",
+      "punishment": "Up to 3 years imprisonment + fine",
+      "cognizable": true,
+      "bailable": false,
+      "triable_by": "Magistrate First Class",
+      "compoundable": false,
+      "additional_remedy": "Also file under Protection of Women from Domestic Violence Act 2005 for immediate protection order",
+      "case_strength_factors": ["Medical reports?", "Witnesses (neighbours, relatives)?", "Prior complaints filed?", "Dowry demands documented?"]
+    },
+
+    {
+      "id": "domestic_dowry_death",
+      "category": "domestic_violence",
+      "keywords": ["dowry death", "dowry harassment", "died after marriage", "burn", "suicide after marriage", "harassment for dowry"],
+      "bns_section": "BNS Section 80",
+      "offence_name": "Dowry Death",
+      "description": "Death of a woman within 7 years of marriage caused by burns/bodily injury or under suspicious circumstances — presumed dowry death",
+      "punishment": "Minimum 7 years to life imprisonment",
+      "cognizable": true,
+      "bailable": false,
+      "triable_by": "Sessions Court",
+      "compoundable": false,
+      "case_strength_factors": ["Time since marriage?", "Evidence of harassment?", "Statements of family?", "Post-mortem report?"]
+    },
+
+    {
+      "id": "property_trespass",
+      "category": "property",
+      "keywords": ["trespass", "entered my property", "broke in", "unlawful entry", "entered without permission", "locked out", "landlord entered"],
+      "bns_section": "BNS Section 329",
+      "offence_name": "Criminal trespass",
+      "description": "Entering property in possession of another to commit an offence or intimidate/insult the person",
+      "punishment": "Up to 3 months imprisonment OR fine up to Rs 5,000 OR both",
+      "cognizable": false,
+      "bailable": true,
+      "triable_by": "Any Magistrate",
+      "compoundable": true,
+      "case_strength_factors": ["Ownership/tenancy proof?", "Witnesses?", "Damage caused?", "Prior disputes?"]
+    },
+
+    {
+      "id": "property_mischief",
+      "category": "property",
+      "keywords": ["damaged property", "destroyed", "broke", "vandalism", "mischief", "car damaged", "property destroyed"],
+      "bns_section": "BNS Section 324",
+      "offence_name": "Mischief",
+      "description": "Intentionally causing wrongful loss or damage to property",
+      "punishment": "Up to 6 months imprisonment OR fine OR both. If damage exceeds Rs 20,000: up to 2 years",
+      "cognizable": false,
+      "bailable": true,
+      "triable_by": "Any Magistrate",
+      "compoundable": true,
+      "case_strength_factors": ["Photos of damage?", "Valuation of damage?", "Witnesses?", "CCTV?"]
+    },
+
+    {
+      "id": "property_landlord_illegal",
+      "category": "property",
+      "keywords": ["landlord locked", "flat locked", "evicted illegally", "belongings kept", "forced out", "rent dispute", "landlord harassment"],
+      "bns_section": "BNS Section 329 + BNS Section 351",
+      "offence_name": "Criminal Trespass + Criminal Intimidation",
+      "description": "Landlord unlawfully locking tenant out or entering premises without due process amounts to criminal trespass and intimidation",
+      "punishment": "Up to 2 years + fine (combined charges)",
+      "cognizable": false,
+      "bailable": true,
+      "triable_by": "Any Magistrate",
+      "compoundable": true,
+      "additional_remedy": "File civil suit for injunction in civil court. If rent-controlled area, approach Rent Controller.",
+      "case_strength_factors": ["Rental agreement available?", "Rent receipts?", "Witnesses to illegal lockout?", "Photos of locked premises?"]
+    },
+
+    {
+      "id": "workplace_salary",
+      "category": "workplace",
+      "keywords": ["salary not paid", "wages not paid", "employer not paying", "unpaid salary", "salary withheld", "dues not given", "3 months salary", "payment not received"],
+      "bns_section": "Payment of Wages Act 1936 Section 5 (non-payment of wages) + BNS Section 318 (cheating, if employer fraudulently induced work without intent to pay)",
+      "offence_name": "Non-payment of wages / Cheating",
+      "description": "Withholding earned wages is an offence under Payment of Wages Act. If employer fraudulently induced work without intending to pay, also cheating under BNS.",
+      "punishment": "Payment of Wages Act: Fine up to Rs 22,500 + compensation up to 10x withheld wages. Criminal cheating under BNS 318: up to 3 years imprisonment + fine",
+      "cognizable": false,
+      "bailable": true,
+      "triable_by": "Labour Court / Any Magistrate",
+      "compoundable": true,
+      "additional_remedy": "File complaint with Labour Commissioner immediately. Also file with PF/ESIC authorities if contributions withheld.",
+      "case_strength_factors": ["Employment contract / offer letter?", "Salary slips?", "Bank records of previous payments?", "Company registration details?"]
+    },
+
+    {
+      "id": "workplace_harassment",
+      "category": "workplace",
+      "keywords": ["sexual harassment", "harassed at work", "workplace harassment", "boss harassment", "POSH", "office harassment"],
+      "bns_section": "BNS Section 74 + POSH Act 2013",
+      "offence_name": "Sexual Harassment at Workplace",
+      "description": "Any unwelcome sexual behaviour at workplace — verbal, physical, or through gesture",
+      "punishment": "Up to 3 years imprisonment + fine under BNS Section 74",
+      "cognizable": false,
+      "bailable": true,
+      "triable_by": "Magistrate First Class",
+      "compoundable": false,
+      "additional_remedy": "File complaint with Internal Complaints Committee (ICC) of the organisation or Local Complaints Committee (LCC) if employer has fewer than 10 employees.",
+      "case_strength_factors": ["Written complaint filed with ICC?", "Witnesses?", "Messages/emails as evidence?", "Pattern of behaviour?"]
+    }
+
+  ]
+}
