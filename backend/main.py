@@ -8,19 +8,17 @@ Full feature set: Judge Engine + Lex-Validator features
 - Compliance scoring
 - BSA Section 63 evidence certificate
 """
-
-import os, time, traceback
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import time, traceback
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import PlainTextResponse, JSONResponse, FileResponse
 from dotenv import load_dotenv
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client as TwilioClient
 import requests
-
-import sys
-sys.path.append(os.path.dirname(__file__))
 from judge_engine import get_judge, reset_judge
-from m3_evidence.evidence import generate_evidence_certificate
+from modules.m3_evidence.evidence import generate_evidence_certificate
 from lex_validator import (
     compute_compliance_score,
     generate_migration_message,

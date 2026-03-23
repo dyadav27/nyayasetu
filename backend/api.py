@@ -12,22 +12,21 @@ Endpoints:
 Run: uvicorn api:app --reload --port 8001
 (WhatsApp bot runs on port 8000, website API on 8001)
 """
-
-import os, sys, json, time, uuid
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import json, time, uuid
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
-sys.path.append(os.path.dirname(__file__))
 from document_analyzer import analyze_document, DocumentRAG, fetch_case_laws
 from lex_validator import (
     compute_compliance_score,
     generate_migration_message,
     extract_text_from_pdf_bytes,
 )
-from m3_evidence.evidence import generate_evidence_certificate
+from modules.m3_evidence.evidence import generate_evidence_certificate
 
 load_dotenv()
 

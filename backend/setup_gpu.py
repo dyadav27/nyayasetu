@@ -181,7 +181,7 @@ def run_smoke_test():
     answer = input("\n   Run SpeechT5 GPU test? (downloads ~300 MB first time) [y/N]: ").strip().lower()
     if answer == "y":
         try:
-            from m1_voice.voice_pipeline import SpeechT5GPU
+            from modules.m1_voice.voice_pipeline import SpeechT5GPU
             audio = SpeechT5GPU.synthesise("Testing Nyaya-Setu voice on RTX 4050.")
             with open("gpu_tts_test.wav", "wb") as f:
                 f.write(audio)

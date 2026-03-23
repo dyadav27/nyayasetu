@@ -14,7 +14,7 @@ from lex_validator import verify_citations, format_irac
 load_dotenv()
 
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
-KB_PATH      = os.path.join(os.path.dirname(__file__), "data", "legal_kb.json")
+KB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "legal_kb.json")
 
 
 # ── Load knowledge base ────────────────────────────────────────────────────────

@@ -15,8 +15,8 @@ Handles:
 import os, sys, re, json, time
 import requests as req
 from typing import Optional
-sys.path.append(os.path.dirname(__file__))
-
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import fitz          # PyMuPDF
 import chromadb
 import ollama
