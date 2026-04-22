@@ -7,9 +7,9 @@ const Steps = ({ current, t }) => {
   return (
     <div style={{ display: "flex", alignItems: "center", marginBottom: 36, overflowX: "auto", paddingBottom: 4 }}>
       {steps.map((s, i) => {
-        const done   = i < current;
+        const done = i < current;
         const active = i === current;
-        const color  = done ? "#34d399" : active ? t.blue : t.muted;
+        const color = done ? "#34d399" : active ? t.blue : t.muted;
         return (
           <div key={i} style={{ display: "flex", alignItems: "center", flex: i < steps.length - 1 ? 1 : 0, minWidth: 0 }}>
             <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 5, flexShrink: 0 }}>
@@ -72,7 +72,7 @@ const OTPInput = ({ value, onChange, t }) => {
           ref={el => inputs.current[i] = el}
           type="text" inputMode="numeric" maxLength={1}
           value={d.trim()}
-          onChange={() => {}}
+          onChange={() => { }}
           onKeyDown={e => handleKey(i, e)}
           onFocus={e => e.target.select()}
           onPaste={e => {
@@ -114,30 +114,27 @@ const Countdown = ({ seconds, onExpire, t }) => {
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default function Evidence({ t, toast, state, setState }) {
-  const useP = !!setState;
-
-  // Local state (not persisted — wizard resets on page change intentionally for security)
-  const [file,          setFile]          = useState(null);
-  const [prev,          setPrev]          = useState(null);
-  const [name,          setName]          = useState("");
-  const [phone,         setPhone]         = useState("");
-  const [address,       setAddress]       = useState("");
-  const [brief,         setBrief]         = useState("");
-  const [incDate,       setIncDate]       = useState("");
+  const [file, setFile] = useState(null);
+  const [prev, setPrev] = useState(null);
+  const [name, setName] = useState("");
+  const [phone, setPhone] = useState("");
+  const [address, setAddress] = useState("");
+  const [brief, setBrief] = useState("");
+  const [incDate, setIncDate] = useState("");
   const [policeStation, setPoliceStation] = useState("");
-  const [step,          setStep]          = useState(0);
-  const [cert,          setCert]          = useState(null);
+  const [step, setStep] = useState(0);
+  const [cert, setCert] = useState(null);
 
-  // OTP state
-  const [otpSent,     setOtpSent]     = useState(false);
-  const [otpValue,    setOtpValue]    = useState("");
+  const [otpSent, setOtpSent] = useState(false);
+  const [otpValue, setOtpValue] = useState("");
   const [otpVerified, setOtpVerified] = useState(false);
-  const [otpExpired,  setOtpExpired]  = useState(false);
-  const [otpLoading,  setOtpLoading]  = useState(false);
+  const [otpExpired, setOtpExpired] = useState(false);
+  const [otpLoading, setOtpLoading] = useState(false);
   const [verifyLoading, setVerifyLoading] = useState(false);
+  const [dlLoading, setDlLoading] = useState(false);   // NEW
 
   const [load, setLoad] = useState(false);
-  const [err,  setErr]  = useState(null);
+  const [err, setErr] = useState(null);
   const fileRef = useRef();
 
   const pickFile = (f) => {
@@ -188,13 +185,13 @@ export default function Evidence({ t, toast, state, setState }) {
     setLoad(true); setErr(null);
     try {
       const fd = new FormData();
-      fd.append("file",                file);
-      fd.append("complainant_name",    name    || "Not provided");
-      fd.append("complainant_phone",   phone   || "");
+      fd.append("file", file);
+      fd.append("complainant_name", name || "Not provided");
+      fd.append("complainant_phone", phone || "");
       fd.append("complainant_address", address || "");
-      fd.append("incident_brief",      brief   || "Evidence submitted via NyayaSetu");
-      fd.append("incident_date",       incDate || "");
-      fd.append("police_station",      policeStation || "");
+      fd.append("incident_brief", brief || "Evidence submitted via NyayaSetu");
+      fd.append("incident_date", incDate || "");
+      fd.append("police_station", policeStation || "");
 
       const r = await fetch("http://localhost:8001/api/evidence", { method: "POST", body: fd });
       const d = await r.json();
@@ -204,6 +201,31 @@ export default function Evidence({ t, toast, state, setState }) {
       toast("Certificate generated ✓", "success");
     } catch (e) { setErr(e.message); toast(e.message, "error"); }
     finally { setLoad(false); }
+  };
+
+  // ── Download PDF (fetch as blob → force download) ── NEW ───────────────────
+  const downloadPdf = async () => {
+    const url = cert?.pdf_download_url || cert?.pdf_url;
+    if (!url) return;
+    setDlLoading(true);
+    try {
+      const r = await fetch(`http://localhost:8001${url}`);
+      if (!r.ok) throw new Error("Could not fetch PDF");
+      const blob = await r.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = `BSA_Certificate_NS-${cert.certificate_id}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(blobUrl);
+      toast("PDF downloaded ✓", "success");
+    } catch (e) {
+      toast("Download failed: " + e.message, "error");
+    } finally {
+      setDlLoading(false);
+    }
   };
 
   const reset = () => {
@@ -280,9 +302,7 @@ export default function Evidence({ t, toast, state, setState }) {
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
               <div>
                 <Label text="Phone Number" required t={t} />
-                <div style={{ display: "flex", gap: 8 }}>
-                  <Input value={phone} onChange={e => { setPhone(e.target.value); setOtpVerified(false); setOtpSent(false); }} placeholder="9876543210" t={t} />
-                </div>
+                <Input value={phone} onChange={e => { setPhone(e.target.value); setOtpVerified(false); setOtpSent(false); }} placeholder="9876543210" t={t} />
                 <p style={{ fontSize: 11, color: t.muted, margin: "5px 0 0" }}>You will receive a WhatsApp OTP on this number</p>
               </div>
               <div>
@@ -319,7 +339,6 @@ export default function Evidence({ t, toast, state, setState }) {
       {step === 2 && (
         <Card t={t}>
           <div style={{ textAlign: "center", maxWidth: 420, margin: "0 auto" }}>
-            {/* Icon */}
             <div style={{ width: 64, height: 64, borderRadius: 18, background: `${t.blue}14`, border: `1px solid ${t.blue}22`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 20px" }}>
               <span style={{ fontSize: 28 }}>📱</span>
             </div>
@@ -524,14 +543,13 @@ export default function Evidence({ t, toast, state, setState }) {
             </div>
           </Card>
 
+          {/* ── Download + New Certificate buttons ── */}
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             {(cert.pdf_download_url || cert.pdf_url) && (
-              <a href={`http://localhost:8001${cert.pdf_download_url || cert.pdf_url}`} target="_blank" rel="noreferrer" style={{ textDecoration: "none" }}>
-                <Btn t={t} onClick={() => {}}>
-                  <Ic d={ICONS.external} size={14} color="#fff" sw={2} />
-                  Download PDF Certificate
-                </Btn>
-              </a>
+              <Btn onClick={downloadPdf} disabled={dlLoading} loading={dlLoading} t={t}>
+                <Ic d={ICONS.external} size={14} color="#fff" sw={2} />
+                {dlLoading ? "Downloading…" : "Download PDF Certificate"}
+              </Btn>
             )}
             <button onClick={reset} style={{ background: "none", border: `1.5px solid ${t.border}`, borderRadius: 8, cursor: "pointer", color: t.sub, fontSize: 13, fontFamily: "inherit", fontWeight: 600, padding: "10px 20px" }}>
               + New Certificate
