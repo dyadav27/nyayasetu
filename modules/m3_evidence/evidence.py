@@ -4,7 +4,7 @@ Nyaya-Setu | Team IKS | SPIT CSE 2025-26
 
 GPU note: M3 is pure CPU/IO — no GPU needed.
 """
-
+import requests
 import hashlib, io, os, datetime
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
@@ -75,6 +75,7 @@ def _gps(exif: dict) -> str:
         return "GPS data present but malformed"
 
 
+
 def generate_evidence_certificate(
     file_bytes:          bytes,
     file_name:           str,
@@ -125,8 +126,9 @@ def generate_evidence_certificate(
         police_station          = police_station or "",
     )
 
-    pdf = _render_pdf(cert)
-    return cert, pdf
+    pdf              = _render_pdf(cert)
+    blockchain_result = store_certificate_on_blockchain(cert)
+    return cert, pdf, blockchain_result
 
 
 def _render_pdf(cert: EvidenceCertificate) -> bytes:
@@ -256,6 +258,48 @@ def _render_pdf(cert: EvidenceCertificate) -> bytes:
 def verify_hash(file_bytes: bytes, expected: str) -> bool:
     return compute_sha256(file_bytes) == expected
 
+def store_certificate_on_blockchain(cert: EvidenceCertificate) -> dict:
+    """
+    Anchors the SHA-256 hash on Hyperledger Fabric via the REST API
+    running in WSL. WSL2 shares localhost with Windows so 127.0.0.1:8080 works.
+    Fails silently — certificate PDF is still valid even if blockchain is down.
+    """
+    try:
+        # Mask phone: "9876543210" → "+91****3210"
+        raw_phone = cert.complainant_phone or ""
+        masked    = "+91****" + raw_phone[-4:] if len(raw_phone) >= 4 else "Not provided"
+
+        response = requests.post(
+            "http://127.0.0.1:8080/store",
+            json={
+                "certID":        f"NS-{cert.certificate_id}",
+                "sha256Hash":    cert.sha256_hash,
+                "fileName":      cert.file_name,
+                "timestamp":     datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "phoneVerified": masked,
+                "incidentType":  cert.incident_brief[:60] if cert.incident_brief else "Not provided",
+                "location":      cert.gps_coordinates,
+            },
+            timeout=10,
+        )
+        data = response.json()
+        return {
+            "blockchain_stored":  data.get("success", False),
+            "blockchain_message": data.get("message", ""),
+            "blockchain_cert_id": f"NS-{cert.certificate_id}",
+        }
+    except requests.exceptions.ConnectionError:
+        return {
+            "blockchain_stored":  False,
+            "blockchain_message": "Fabric REST API not reachable — certificate issued without blockchain record",
+            "blockchain_cert_id": f"NS-{cert.certificate_id}",
+        }
+    except Exception as e:
+        return {
+            "blockchain_stored":  False,
+            "blockchain_message": f"Blockchain error: {str(e)}",
+            "blockchain_cert_id": f"NS-{cert.certificate_id}",
+        }
 
 if __name__ == "__main__":
     import sys
