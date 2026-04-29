@@ -3,9 +3,9 @@ M2 — RAG Engine: Query + Generation  [GPU-ACCELERATED]
 Nyaya-Setu | Team IKS | SPIT CSE 2025-26
 
 GPU usage:
-  - Bi-encoder  (MiniLM)      → RTX 4050  ~90 MB VRAM
-  - Cross-encoder (ms-marco)  → RTX 4050  ~90 MB VRAM
-  - Llama-3 8B (4-bit)        → RTX 4050  ~4.5 GB VRAM via Ollama
+  - Bi-encoder  (MiniLM)      → GPU  ~90 MB VRAM
+  - Cross-encoder (ms-marco)  → GPU  ~90 MB VRAM
+  - LLM                       → Groq Cloud API (no local GPU needed)
 
 IMPORTANT: Set these two paths to your local model folders before running.
 """
@@ -19,7 +19,7 @@ import numpy as np
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
 from pydantic import BaseModel, Field
-import ollama
+from groq import Groq
 from dotenv import load_dotenv
 from gpu_utils import DEVICE, print_gpu_status, clear_gpu_cache
 
@@ -34,7 +34,10 @@ CHROMA_DIR      = "data/chromadb"
 COLLECTION      = "nyayasetu_legal"
 RETRIEVAL_TOP_K = 20
 RERANK_TOP_N    = 3
-OLLAMA_MODEL    = "llama3"
+GROQ_MODEL      = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+# ── Groq client ────────────────────────────────────────────────────────────────
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
 # ── Pydantic output schema ─────────────────────────────────────────────────────
@@ -77,9 +80,9 @@ class NyayaSetuRAG:
         print("[RAG] Building BM25 index in RAM...")
         self._build_bm25()
 
-        # Ollama
-        print(f"[RAG] Ollama LLM: {OLLAMA_MODEL} (GPU via Ollama)")
-        self._verify_ollama()
+        # Groq Cloud LLM
+        print(f"[RAG] Groq LLM: {GROQ_MODEL} (cloud API)")
+        self._verify_groq()
 
     def _build_bm25(self):
         result          = self.collection.get(include=["documents", "metadatas"])
@@ -90,23 +93,17 @@ class NyayaSetuRAG:
         self.bm25       = BM25Okapi(tokenized)
         print(f"[RAG] BM25 index: {len(self._all_docs)} docs")
 
-    def _verify_ollama(self):
+    def _verify_groq(self):
         try:
-            response = ollama.list()
-            # handle both old and new ollama API formats
-            models_data = response.get("models", []) if isinstance(response, dict) else []
-            model_names = []
-            for m in models_data:
-                if isinstance(m, dict):
-                    model_names.append(m.get("name", "") or m.get("model", ""))
-                else:
-                    model_names.append(str(m))
-            if any(OLLAMA_MODEL in n for n in model_names):
-                print(f"[RAG] ✅ Ollama model '{OLLAMA_MODEL}' ready on GPU.")
-            else:
-                print(f"[RAG] ⚠️  Model not confirmed. Will try anyway.")
+            # Quick test to verify API key works
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": "Say OK"}],
+                max_tokens=5,
+            )
+            print(f"[RAG] ✅ Groq API verified — model '{GROQ_MODEL}' ready.")
         except Exception as e:
-            print(f"[RAG] ⚠️  Ollama check failed: {e} — will try anyway.")
+            print(f"[RAG] ⚠️  Groq API check failed: {e} — will try anyway.")
 
     def _hybrid_retrieve(self, query: str) -> list[dict]:
         # Semantic search on GPU
@@ -189,17 +186,13 @@ Output this exact JSON structure with all fields filled:
 }}"""
 
     def _call_llm(self, prompt: str) -> str:
-        response = ollama.chat(
-            model=OLLAMA_MODEL,
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            options={
-                "temperature": 0.0,   # fully deterministic
-                "num_ctx":     4096,
-                "num_gpu":     99,    # all layers on RTX 4050
-                "num_thread":  4,
-            },
+            temperature=0.0,
+            max_tokens=4096,
         )
-        return response["message"]["content"]
+        return response.choices[0].message.content
 
     def _parse(self, raw: str, complainant_name: str) -> FIRComplaint:
         # Clean up common LLM formatting issues

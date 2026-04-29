@@ -29,17 +29,22 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import fitz          # PyMuPDF
-import ollama
+from groq import Groq
 from sentence_transformers import SentenceTransformer
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from gpu_utils import DEVICE
+from legal_translator import detect_language_with_llm, translate_legal_text
+import base64
 
 load_dotenv()
 
-OLLAMA_MODEL         = os.getenv("OLLAMA_MODEL", "llama3")
+GROQ_MODEL           = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 INDIANKANOON_API_KEY = os.getenv("INDIANKANOON_API_KEY", "")
-EMBED_MODEL = r"C:\Users\Nitin Sharma\.cache\huggingface\hub\models--sentence-transformers--all-MiniLM-L6-v2\snapshots\8b3219a92973c328a8e22fadcfa821b5dc75636a"
+EMBED_MODEL = "all-MiniLM-L6-v2"   # resolved from HuggingFace cache automatically
+
+# ── Groq client ────────────────────────────────────────────────────────────────
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -173,6 +178,13 @@ class SignatureVerdict(BaseModel):
     color:   str   # green / orange / red
     reason:  str
 
+class SectionExplanation(BaseModel):
+    section:      str
+    title:        str
+    explanation:  str
+    punishment:   str = ""
+    key_elements: list[str] = []
+
 class DocumentAnalysis(BaseModel):
     document_name:       str
     document_type:       str
@@ -193,6 +205,13 @@ class DocumentAnalysis(BaseModel):
     deadlines:           list[Deadline]
     suggested_questions: list[str]
     signature_verdict:   SignatureVerdict
+    original_text:          Optional[str]   = None
+    source_language:        Optional[str]   = None
+    full_translation:       Optional[str]   = None   # complete English text (shown in Translation tab)
+    translation_engine:     Optional[str]   = None   # e.g. "sarvam-indictrans2"
+    translation_confidence: Optional[float] = None
+    mentioned_sections:     list[str]       = []     # BNS/IPC/CrPC refs found in document
+    section_explanations:   list[dict]      = []     # plain-English explanation of each section
 
 class QAResponse(BaseModel):
     question:   str
@@ -203,27 +222,70 @@ class QAResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────
-# Text extraction
+# Text extraction & Vision OCR
 # ─────────────────────────────────────────────────────────────
+def extract_text_with_vision(image_bytes: bytes) -> str:
+    """Use Groq Llama 3.2 Vision to extract text from an image."""
+    try:
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        completion = groq_client.chat.completions.create(
+            model="llama-3.2-90b-vision-preview",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Extract all text from this image exactly as it appears. Do not add any commentary. If the text is in an Indian language (like Marathi or Hindi), transcribe it perfectly in its native script."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            temperature=0.0,
+            max_tokens=2048
+        )
+        return completion.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[VISION] Failed to extract text: {e}")
+        return ""
+
 def extract_text(file_bytes: bytes, filename: str) -> str:
     fname = filename.lower()
+    
+    # 1. Handle PDFs
     if fname.endswith(".pdf"):
-        doc  = fitz.open(stream=file_bytes, filetype="pdf")
-        text = "\n".join(page.get_text("text") for page in doc)
-        doc.close()
-        return text.strip()
-    elif any(fname.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
-        try:
-            import pytesseract
-            from PIL import Image
-            import io
-            img = Image.open(io.BytesIO(file_bytes))
-            return pytesseract.image_to_string(img).strip()
-        except ImportError:
-            doc  = fitz.open(stream=file_bytes, filetype="pdf")
-            text = "\n".join(page.get_text() for page in doc)
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        text = "\n".join(page.get_text("text") for page in doc).strip()
+        
+        # SMART FALLBACK: If it's a scanned PDF, get_text() will return < 50 chars
+        if len(text) < 50:
+            print("[ANALYZER] PDF seems to be a scanned image. Falling back to Vision OCR...")
+            vision_text = []
+            # Extract first 3 pages max to prevent API overload
+            for page_num in range(min(3, len(doc))):
+                page = doc.load_page(page_num)
+                pix = page.get_pixmap(dpi=150)
+                img_bytes = pix.tobytes("jpeg")
+                extracted = extract_text_with_vision(img_bytes)
+                if extracted:
+                    vision_text.append(extracted)
             doc.close()
-            return text.strip()
+            return "\n\n".join(vision_text).strip()
+            
+        doc.close()
+        return text
+
+    # 2. Handle raw Images
+    elif any(fname.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
+        print("[ANALYZER] Image detected. Using Vision OCR...")
+        return extract_text_with_vision(file_bytes)
+        
     return ""
 
 
@@ -276,16 +338,46 @@ def detect_document_type(text: str) -> tuple[str, str, int]:
     return best_key, DOCUMENT_TYPES[best_key]["label"], confidence
 
 
-# ─────────────────────────────────────────────────────────────
-# LLM helpers
-# ─────────────────────────────────────────────────────────────
+# Two-tier model strategy:
+#   GROQ_MODEL (70b)        — complex reasoning: summary, section explanations, party obligations
+#   GROQ_FAST_MODEL (8b)    — high-volume repetitive: clause analysis, key numbers, deadlines, etc.
+# Free-tier TPM limits: 70b = 12,000 | 8b = 30,000
+GROQ_FAST_MODEL = os.getenv("GROQ_FAST_MODEL", "llama-3.1-8b-instant")
+
+import time as _time
+
+def _groq_call(model: str, prompt: str, temperature: float, max_tokens: int) -> str:
+    """Raw Groq call with automatic retry on 429 rate-limit errors."""
+    for attempt in range(4):
+        try:
+            resp = groq_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "rate_limit" in msg.lower():
+                wait = 3 * (attempt + 1)   # 3s, 6s, 9s, 12s
+                print(f"[LLM] Rate limit hit. Waiting {wait}s (attempt {attempt+1}/4)...")
+                _time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("Groq rate limit: exceeded max retries")
+
+
 def call_llm(prompt: str, temperature: float = 0.1) -> str:
-    response = ollama.chat(
-        model=OLLAMA_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        options={"temperature": temperature, "num_ctx": 4096, "num_gpu": 99},
-    )
-    return response["message"]["content"].strip()
+    """Use the heavy 70b model — for complex, one-off reasoning tasks."""
+    return _groq_call(GROQ_MODEL, prompt, temperature, max_tokens=3000)
+
+
+def call_llm_fast(prompt: str, temperature: float = 0.1) -> str:
+    """Use the fast 8b model — for repetitive clause-level tasks (30k TPM)."""
+    return _groq_call(GROQ_FAST_MODEL, prompt, temperature, max_tokens=1500)
+
+
 
 
 def parse_json_response(raw: str, fallback):
@@ -336,7 +428,7 @@ Risk guide:
 - High Risk: significantly unfair, likely challengeable in court
 - Illegal: violates Indian law (Consumer Protection Act, Contract Act, BNS 2023, labour laws)"""
 
-    raw  = call_llm(prompt)
+    raw  = call_llm_fast(prompt)
     data = parse_json_response(raw, {})
 
     return ClauseAnalysis(
@@ -420,7 +512,7 @@ Return ONLY valid JSON array.
 DOCUMENT:
 {text[:3000]}"""
 
-    raw  = call_llm(prompt, temperature=0.1)
+    raw  = call_llm_fast(prompt, temperature=0.1)
     data = parse_json_response(raw, [])
     results = []
     for item in (data if isinstance(data, list) else []):
@@ -469,7 +561,7 @@ Return ONLY valid JSON array.
 DOCUMENT:
 {text[:4000]}"""
 
-    raw  = call_llm(prompt, temperature=0.0)
+    raw  = call_llm_fast(prompt, temperature=0.0)
     data = parse_json_response(raw, [])
     results = []
     for item in (data if isinstance(data, list) else []):
@@ -481,7 +573,14 @@ DOCUMENT:
             ))
         except Exception:
             pass
-    return results
+    # Deduplicate by (normalised value, type)
+    seen, unique = set(), []
+    for n in results:
+        key = (re.sub(r'\s+', '', n.value.strip().lower()), n.type)
+        if key not in seen:
+            seen.add(key)
+            unique.append(n)
+    return unique
 
 
 # ─────────────────────────────────────────────────────────────
@@ -502,7 +601,7 @@ Return ONLY valid JSON array.
 DOCUMENT:
 {text[:3000]}"""
 
-    raw  = call_llm(prompt, temperature=0.0)
+    raw  = call_llm_fast(prompt, temperature=0.0)
     data = parse_json_response(raw, [])
     results = []
     for item in (data if isinstance(data, list) else []):
@@ -600,46 +699,107 @@ def compute_overall_risk(clauses: list[ClauseAnalysis]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+# Legal section extraction + explanation
+# ─────────────────────────────────────────────────────────────
+def extract_legal_sections(text: str) -> list[str]:
+    """Extract BNS / IPC / CrPC / BNSS / BSA section references from the document text."""
+    patterns = [
+        r'(?:BNS|Bharatiya Nyaya Sanhita)\s*(?:Section|Sec\.?|S\.)?\s*\d+(?:\s*\([^)]+\))?',
+        r'(?:IPC|Indian Penal Code)\s*(?:Section|Sec\.?)?\s*\d+(?:\s*\([^)]+\))?',
+        r'(?:CrPC|BNSS|Bharatiya Nagarik Suraksha Sanhita)\s*(?:Section|Sec\.?)?\s*\d+(?:\s*\([^)]+\))?',
+        r'(?:BSA|Bharatiya Sakshya Adhiniyam)\s*(?:Section|Sec\.?)?\s*\d+(?:\s*\([^)]+\))?',
+        r'[Ss]ection\s*\d+(?:\s*\([^)]+\))?\s+(?:of\s+(?:the\s+)?)?(?:BNS|IPC|CrPC|BNSS|BSA|Indian Penal Code|Bharatiya Nyaya Sanhita)',
+        r'[Uu]/[Ss]\s*\d+(?:\s*\([^)]+\))?',   # shorthand u/s 420
+    ]
+    found = set()
+    for p in patterns:
+        for m in re.finditer(p, text, re.IGNORECASE):
+            s = m.group(0).strip()
+            if len(s) > 4:
+                found.add(s)
+    return sorted(found)[:12]
+
+
+def explain_legal_sections(sections: list[str], doc_type: str) -> list[dict]:
+    """Return plain-English explanations for each section using Groq."""
+    if not sections:
+        return []
+    slist = "\n".join(f"- {s}" for s in sections[:8])
+    prompt = (
+        f"You are an expert in Indian law (IPC, BNS 2023, CrPC, BNSS 2023, BSA 2023).\n"
+        f"A {doc_type} mentions these legal provisions. Explain each one for a non-lawyer.\n\n"
+        f"SECTIONS:\n{slist}\n\n"
+        "Return a JSON array:\n"
+        '[{\n'
+        '  "section": "BNS Section 304",\n'
+        '  "title": "Theft",\n'
+        '  "explanation": "Punishes taking someone else\'s property without consent with dishonest intent.",\n'
+        '  "punishment": "Imprisonment up to 3 years, or fine, or both",\n'
+        '  "key_elements": ["Dishonest intention", "Property belongs to another", "Without consent"]\n'
+        "}]\n\n"
+        "Be accurate about BNS 2023 sections. Return ONLY valid JSON array."
+    )
+    raw  = call_llm(prompt, temperature=0.0)
+    data = parse_json_response(raw, [])
+    return data if isinstance(data, list) else []
+
+
+# ─────────────────────────────────────────────────────────────
 # IndianKanoon
 # ─────────────────────────────────────────────────────────────
-def fetch_case_laws(query: str, doc_type: str) -> list[dict]:
+def fetch_case_laws(query: str, doc_type: str, sections: list[str] = None) -> list[dict]:
+    """Fetch case laws — searches each legal section first, then falls back to general query."""
     if not INDIANKANOON_API_KEY:
         return [{
             "title":   "IndianKanoon API key not configured",
             "summary": "Add INDIANKANOON_API_KEY to your .env file.",
             "url":     "https://indiankanoon.org",
-            "court":   "",
-            "year":    "",
+            "court":   "", "year": "", "related_section": None,
         }]
-    try:
-        response = req.post(
-            "https://api.indiankanoon.org/search/",
-            data={"formInput": f"{query} {doc_type} India", "pagenum": 0},
-            headers={
-                "Authorization": f"Token {INDIANKANOON_API_KEY}",
-                "Content-Type":  "application/x-www-form-urlencoded",
-            },
-            timeout=15,
-        )
-        response.raise_for_status()
-        data    = response.json()
-        results = []
-        for doc in data.get("docs", [])[:3]:
-            summary = call_llm(
-                f"Summarize in 2-3 plain English sentences:\n{doc.get('headline','')} {doc.get('doc','')[:500]}\nWrite only the summary.",
-                temperature=0.1,
+
+    # Build targeted queries — specific section searches first
+    queries: list[str] = []
+    if sections:
+        for s in sections[:5]:
+            queries.append(s)
+    queries.append(query[:200])   # general fallback
+
+    results, seen_tids = [], set()
+    for search_q in queries:
+        if len(results) >= 6:
+            break
+        try:
+            r = req.post(
+                "https://api.indiankanoon.org/search/",
+                data={"formInput": search_q, "pagenum": 0},
+                headers={"Authorization": f"Token {INDIANKANOON_API_KEY}",
+                         "Content-Type": "application/x-www-form-urlencoded"},
+                timeout=15,
             )
-            results.append({
-                "title":   doc.get("title", "Untitled"),
-                "summary": summary,
-                "url":     f"https://indiankanoon.org/doc/{doc.get('tid', '')}",
-                "court":   doc.get("docsource", ""),
-                "year":    doc.get("publishdate", "")[:4] if doc.get("publishdate") else "",
-            })
-        return results
-    except Exception as e:
-        print(f"[KANOON] API error: {e}")
-        return []
+            r.raise_for_status()
+            for doc in r.json().get("docs", [])[:3]:
+                tid = doc.get("tid", "")
+                if tid in seen_tids:
+                    continue
+                seen_tids.add(tid)
+                summary = call_llm(
+                    f"Summarize this Indian court judgment in 2-3 plain English sentences "
+                    f"relevant to '{search_q}':\n{doc.get('headline','')} {doc.get('doc','')[:500]}\n"
+                    "Write only the summary.",
+                    temperature=0.1,
+                )
+                results.append({
+                    "title":           doc.get("title", "Untitled"),
+                    "summary":         summary,
+                    "url":             f"https://indiankanoon.org/doc/{tid}",
+                    "court":           doc.get("docsource", ""),
+                    "year":            doc.get("publishdate", "")[:4] if doc.get("publishdate") else "",
+                    "related_section": search_q if (sections and search_q in sections) else None,
+                })
+        except Exception as e:
+            print(f"[KANOON] Error for '{search_q[:60]}': {e}")
+    return results
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -674,89 +834,58 @@ class DocumentRAG:
         return [self.chunks[i] for i in top_idx]
 
     def answer(self, question: str) -> QAResponse:
-        """Answer using RAG + multi-turn conversation history."""
-        print(f"[DocRAG.answer] Question: {question[:100]}...")
-        print(f"[DocRAG.answer] Chunks available: {len(self.chunks)}")
-        
+        """Bulletproof multi-turn Q&A with legal expert system prompt."""
+        print(f"[DocRAG.answer] Q: {question[:100]}")
         if not self.chunks:
-            print(f"[DocRAG.answer] No chunks indexed!")
-            return QAResponse(
-                question=question,
-                answer="No document content available to answer this question.",
-                confidence=0.0,
-                sources=[],
-                disclaimer="Please upload a document first."
-            )
-        
-        # Retrieve relevant chunks
-        relevant = self.retrieve(question)
-        print(f"[DocRAG.answer] Retrieved {len(relevant)} chunks")
-        
-        if not relevant:
-            print(f"[DocRAG.answer] No relevant chunks found")
-            return QAResponse(
-                question=question,
-                answer="I couldn't find relevant information in the document to answer this question.",
-                confidence=0.2,
-                sources=[],
-                disclaimer="Try rephrasing your question."
-            )
-        
+            return QAResponse(question=question,
+                answer="No document indexed. Please upload a document first.",
+                confidence=0.0, sources=[], disclaimer="Upload a document to begin.")
+
+        # Top-6 relevant chunks + always include opening paragraph for context
+        relevant = self.retrieve(question, top_k=6)
+        if self.chunks and self.chunks[0] not in relevant:
+            relevant = [self.chunks[0]] + relevant[:5]
         context = "\n\n---\n\n".join(relevant)
-        
-        # Build conversation history
-        history_text = ""
-        if self.history:
-            history_text = "\n\nPREVIOUS CONVERSATION:\n"
-            for turn in self.history[-6:]:
-                role = "User" if turn["role"] == "user" else "Assistant"
-                history_text += f"{role}: {turn['content']}\n"
-            print(f"[DocRAG.answer] Using {len(self.history)} history turns")
-        
-        prompt = f"""You are an Indian legal assistant. Answer the question based on the document excerpts below.
-    If the answer is not in the document, say "This is not specified in the document."
-    Use previous conversation context if relevant to this question.
 
-    DOCUMENT TYPE: {self.doc_type}
-    DOCUMENT EXCERPTS:
-    {context}
-    {history_text}
-    CURRENT QUESTION: {question}
+        system_prompt = (
+            f"You are NyayaBot, an elite Indian legal analyst with deep expertise in:\n"
+            f"- Bharatiya Nyaya Sanhita (BNS) 2023 & Indian Penal Code (IPC) 1860\n"
+            f"- BNSS 2023 & CrPC | Bharatiya Sakshya Adhiniyam (BSA) 2023\n"
+            f"- FIR procedure, bail, arrest, trial, constitutional rights (Articles 20-22)\n\n"
+            f"You are analysing a {self.doc_type}. Answer ONLY from the document below.\n\n"
+            f"DOCUMENT CONTENT:\n{context}\n\n"
+            "RULES (strictly follow):\n"
+            "1. Base every answer strictly on the document. If not mentioned, say so explicitly.\n"
+            "2. For follow-up / cross-questions, use conversation history for continuity.\n"
+            "3. Cite specific sections, names, dates, or clause text from the document.\n"
+            "4. Define any legal term in plain language immediately after using it.\n"
+            "5. Never speculate or hallucinate facts not present in the document."
+        )
 
-    Give a clear, plain English answer in 2-4 sentences. No legal jargon."""
-        
+        messages = [{"role": "system", "content": system_prompt}]
+        for turn in self.history[-10:]:
+            messages.append(turn)
+        messages.append({"role": "user", "content": question})
+
         try:
-            answer = call_llm(prompt)
-            print(f"[DocRAG.answer] Generated answer: {answer[:100]}...")
-            
-            confidence = compute_confidence(context, answer)
-            
-            # Store in history
-            self.history.append({"role": "user", "content": question})
-            self.history.append({"role": "assistant", "content": answer})
-            
+            resp = groq_client.chat.completions.create(
+                model=GROQ_MODEL, messages=messages, temperature=0.1, max_tokens=2000,
+            )
+            answer_text = resp.choices[0].message.content.strip()
+            self.history.append({"role": "user",      "content": question})
+            self.history.append({"role": "assistant", "content": answer_text})
+            confidence = compute_confidence(context, answer_text)
             disclaimer = ""
             if confidence < 0.4:
-                disclaimer = "⚠️ Low confidence — consult a lawyer for certainty."
-            elif confidence < 0.7:
-                disclaimer = "ℹ️ Moderate confidence — verify with the original document."
-            
-            return QAResponse(
-                question=question,
-                answer=answer,
-                confidence=confidence,
-                sources=[c[:100] for c in relevant],
-                disclaimer=disclaimer,
-            )
+                disclaimer = "⚠ Low confidence — verify with the document or consult a lawyer."
+            elif confidence < 0.65:
+                disclaimer = "ℹ Moderate confidence — cross-check with the original document."
+            return QAResponse(question=question, answer=answer_text, confidence=confidence,
+                sources=[c[:120] for c in relevant[:3]], disclaimer=disclaimer)
         except Exception as e:
-            print(f"[DocRAG.answer] LLM call failed: {e}")
-            return QAResponse(
-                question=question,
-                answer=f"Error generating answer: {str(e)}",
-                confidence=0.0,
-                sources=[],
-                disclaimer="Technical error occurred. Please try again."
-            )
+            print(f"[DocRAG.answer] Error: {e}")
+            return QAResponse(question=question, answer=f"Error: {str(e)}",
+                confidence=0.0, sources=[], disclaimer="Technical error. Please try again.")
 
 # ─────────────────────────────────────────────────────────────
 # Main analysis pipeline
@@ -765,7 +894,7 @@ def analyze_document(
     file_bytes:    bytes,
     filename:      str,
     max_clauses:   int = 15,
-    type_override: Optional[str] = None,   # NEW: user can correct detected type
+    type_override: Optional[str] = None,
 ) -> tuple[DocumentAnalysis, DocumentRAG]:
 
     print(f"\n[ANALYZER] Processing: {filename}")
@@ -776,70 +905,84 @@ def analyze_document(
         raise ValueError("Could not extract text from document.")
     print(f"[ANALYZER] Extracted {len(text)} chars")
 
-    # 2. Document type (with confidence)
+    # 1.5. Auto-translate if regional language
+    lang_info        = detect_language_with_llm(text)
+    source_lang_code = lang_info.get("language_code", "en")
+    source_lang_name = lang_info.get("language_name", "English")
+
+    original_text          = None
+    full_translation       = None
+    translation_engine     = None
+    translation_confidence = None
+
+    if source_lang_code != "en":
+        print(f"[ANALYZER] Detected {source_lang_name}. Translating via Google Gemini...")
+        tr = translate_legal_text(text, source_lang=source_lang_code, target_lang="en")
+        if tr.get("translated_text"):
+            original_text          = text
+            full_translation       = tr["translated_text"]
+            text                   = full_translation
+            translation_engine     = tr.get("engine", "unknown")
+            translation_confidence = tr.get("confidence")
+            print(f"[ANALYZER] Translation done ({translation_engine}).")
+        else:
+            print("[ANALYZER] Translation failed. Using original.")
+            source_lang_name = "English (Fallback)"
+
+    # 1.6. Extract legal section references (BNS, IPC, CrPC …)
+    combined_text      = text + (" " + original_text if original_text else "")
+    mentioned_sections = extract_legal_sections(combined_text)
+    print(f"[ANALYZER] Sections found: {mentioned_sections}")
+
+    # 2. Document type
     if type_override and type_override in DOCUMENT_TYPES:
-        type_key   = type_override
-        doc_type   = DOCUMENT_TYPES[type_key]["label"]
-        type_conf  = 100
+        type_key, doc_type, type_conf = type_override, DOCUMENT_TYPES[type_override]["label"], 100
     else:
         type_key, doc_type, type_conf = detect_document_type(text)
     print(f"[ANALYZER] Type: {doc_type} ({type_conf}%)")
 
-    # 3. Segment clauses
+    # 2.5. Plain-English explanations for every section found
+    section_explanations = []
+    if mentioned_sections:
+        print(f"[ANALYZER] Explaining {len(mentioned_sections)} sections...")
+        section_explanations = explain_legal_sections(mentioned_sections, doc_type)
+
+    # 3. Segment + analyse clauses
     all_clauses = segment_clauses(text)
     clauses     = all_clauses[:max_clauses]
-    print(f"[ANALYZER] {len(all_clauses)} clauses found, analyzing {len(clauses)}")
+    print(f"[ANALYZER] {len(all_clauses)} clauses, analysing {len(clauses)}")
 
-    # 4. Risk score each clause (now includes safer_version)
     analyzed: list[ClauseAnalysis] = []
     for i, clause in enumerate(clauses):
         print(f"[ANALYZER] Clause {i+1}/{len(clauses)}...")
         analyzed.append(analyze_clause(clause, doc_type))
 
-    # 5. Summary
     summary = summarize_document(text, doc_type)
-
-    # 6. Risk distribution
-    dist = {"Safe": 0, "Caution": 0, "High Risk": 0, "Illegal": 0}
+    dist    = {"Safe": 0, "Caution": 0, "High Risk": 0, "Illegal": 0}
     for c in analyzed:
         dist[c.risk_level] = dist.get(c.risk_level, 0) + 1
-
-    # 7. Overall risk
     overall = compute_overall_risk(analyzed)
 
-    # 8. IPC→BNS compliance
     try:
         from lex_validator import compute_compliance_score
         comp_score = compute_compliance_score(text)["score"]
     except Exception:
         comp_score = 75
 
-    # 9. Case laws
-    risky   = [c for c in analyzed if c.risk_level in ["High Risk", "Illegal"]]
-    kw_src  = risky or [c for c in analyzed if c.risk_level == "Caution"]
-    kws     = [c.explanation[:80] for c in kw_src[:2] if c.explanation and len(c.explanation) > 20]
+    # 9. Case laws — section-targeted search first
+    risky    = [c for c in analyzed if c.risk_level in ["High Risk", "Illegal"]]
+    kw_src   = risky or [c for c in analyzed if c.risk_level == "Caution"]
+    kws      = [c.explanation[:80] for c in kw_src[:2] if c.explanation and len(c.explanation) > 20]
     kanoon_q = (f"{doc_type} {' '.join(kws)}")[:200] if kws else doc_type
-    case_laws = fetch_case_laws(kanoon_q, doc_type)
+    case_laws = fetch_case_laws(kanoon_q, doc_type, sections=mentioned_sections)
 
-    # NEW 10. Party obligations
-    party_obligations = extract_party_obligations(text, doc_type)
-
-    # NEW 11. Missing clauses
-    missing_clauses = detect_missing_clauses(text, type_key)
-
-    # NEW 12. Key numbers
-    key_numbers = extract_key_numbers(text)
-
-    # NEW 13. Deadlines
-    deadlines = extract_deadlines(text)
-
-    # NEW 14. Suggested questions
+    party_obligations   = extract_party_obligations(text, doc_type)
+    missing_clauses     = detect_missing_clauses(text, type_key)
+    key_numbers         = extract_key_numbers(text)
+    deadlines           = extract_deadlines(text)
     suggested_questions = generate_suggested_questions(text, doc_type)
+    signature_verdict   = get_signature_verdict(analyzed, missing_clauses)
 
-    # NEW 15. Signature verdict
-    signature_verdict = get_signature_verdict(analyzed, missing_clauses)
-
-    # Recommendations
     recommendations = []
     if dist["Illegal"] > 0:
         recommendations.append(f"⚠️ {dist['Illegal']} clause(s) may violate Indian law. Do not sign without legal review.")
@@ -852,7 +995,6 @@ def analyze_document(
     if not recommendations:
         recommendations.append("✅ Document appears fair. Standard review recommended before signing.")
 
-    # Index for multi-turn Q&A
     doc_rag = DocumentRAG()
     doc_rag.index(all_clauses, doc_type)
 
@@ -875,7 +1017,13 @@ def analyze_document(
         deadlines=deadlines,
         suggested_questions=suggested_questions,
         signature_verdict=signature_verdict,
+        original_text=original_text,
+        source_language=source_lang_name if original_text else None,
+        full_translation=full_translation,
+        translation_engine=translation_engine,
+        translation_confidence=translation_confidence,
+        mentioned_sections=mentioned_sections,
+        section_explanations=section_explanations,
     )
-
     print(f"[ANALYZER] Done. Verdict: {signature_verdict.verdict}")
-    return result, doc_rag
+    return result, doc_rag

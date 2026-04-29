@@ -139,6 +139,41 @@ const TypeConfidenceBanner = ({ result, onTypeChange, t }) => {
   );
 };
 
+/** Translation banner */
+const TranslationBanner = ({ result, showOriginal, setShowOriginal, t }) => {
+  if (!result || !result.original_text) return null;
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap",
+      padding: "12px 16px", borderRadius: 9,
+      background: `${t.blue}0a`, border: `1px solid ${t.blue}33`,
+      marginBottom: 14, fontSize: 13, animation: "fadeUp 0.3s ease",
+    }}>
+      <div style={{ width: 28, height: 28, borderRadius: 8, background: `${t.blue}18`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, flexShrink: 0 }}>
+        🌍
+      </div>
+      <div>
+        <div style={{ fontWeight: 700, color: t.text, fontSize: 13, marginBottom: 2 }}>
+          Translated from {result.source_language}
+        </div>
+        <div style={{ color: t.sub, fontSize: 12 }}>
+          Document was auto-translated to English for accurate analysis.
+        </div>
+      </div>
+      <button onClick={() => setShowOriginal(!showOriginal)} style={{
+        marginLeft: "auto", padding: "6px 12px", borderRadius: 6,
+        background: showOriginal ? t.blue : t.surfaceUp, 
+        color: showOriginal ? "#fff" : t.text,
+        border: `1px solid ${showOriginal ? t.blue : t.border}`,
+        fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+        transition: "all 0.2s"
+      }}>
+        {showOriginal ? "Hide Original" : "View Original Text"}
+      </button>
+    </div>
+  );
+};
+
 /** Party obligation map */
 const PartyObligationMap = ({ obligations, t }) => {
   if (!obligations?.length) return null;
@@ -409,8 +444,9 @@ export default function Analyzer({ t, toast, state, setState }) {
   const [q,      setQ]      = useState("");
   const [qaLoad, setQaLoad] = useState(false);
   const [step,   setStep]   = useState(0);
+  const [showOrig, setShowOrig] = useState(false);
 
-  const STEPS = ["Reading document…", "Detecting type…", "Scoring clauses…", "Extracting insights…", "Fetching case laws…", "Done!"];
+  const STEPS = ["Reading document…", "Detecting language…", "Scoring clauses…", "Extracting insights…", "Fetching case laws…", "Done!"];
 
   // Run analysis
   const run = async (typeOverride = null) => {
@@ -461,10 +497,11 @@ export default function Analyzer({ t, toast, state, setState }) {
   ) || [];
 
   const TABS = [
-    { id: "clauses",  label: "Clauses",       count: result?.clauses?.length },
-    { id: "insights", label: "Insights",       count: null },
-    { id: "qa",       label: "Ask Questions",  count: qaHist.length || null },
-    { id: "caselaws", label: "Case Laws",      count: validCaseLaws.length || null },
+    { id: "clauses",     label: "Clauses",         count: result?.clauses?.length },
+    { id: "insights",   label: "Key Insights",     count: null },
+    { id: "translation",label: "Full Translation", count: null, hidden: !result?.full_translation },
+    { id: "qa",         label: "Ask Questions",    count: qaHist.length || null },
+    { id: "caselaws",   label: "Case Laws",        count: validCaseLaws.length || null },
   ];
 
   return (
@@ -536,6 +573,29 @@ export default function Analyzer({ t, toast, state, setState }) {
             {/* Type confidence + correction (NEW) */}
             <TypeConfidenceBanner result={result} onTypeChange={handleTypeChange} t={t} />
 
+            {/* Translation Banner (NEW) */}
+            <TranslationBanner result={result} showOriginal={showOrig} setShowOriginal={setShowOrig} t={t} />
+
+            {/* Original Text View */}
+            {showOrig && result.original_text && (
+              <div style={{
+                padding: "16px 20px", borderRadius: 10, background: t.surfaceUp, 
+                border: `1px solid ${t.border}`, marginBottom: 16,
+                animation: "fadeUp 0.3s ease"
+              }}>
+                <div style={{ fontSize: 11, fontWeight: 800, color: t.muted, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 12 }}>
+                  Original {result.source_language} Text
+                </div>
+                <div style={{
+                  fontSize: 13, color: t.sub, lineHeight: 1.8, 
+                  whiteSpace: "pre-wrap", maxHeight: 400, overflowY: "auto",
+                  paddingRight: 10
+                }}>
+                  {result.original_text}
+                </div>
+              </div>
+            )}
+
             {/* Summary */}
             <div style={{ padding: "14px 18px", borderRadius: 10, background: `${t.blue}0a`, border: `1px solid ${t.blue}20`, marginBottom: 16, fontSize: 14, color: t.text, lineHeight: 1.75 }}>
               {result.summary}
@@ -564,19 +624,19 @@ export default function Analyzer({ t, toast, state, setState }) {
 
           {/* ── Tabs ── */}
           <div style={{ display: "flex", gap: 3, marginBottom: 16, flexWrap: "wrap" }}>
-            {TABS.map(tb => (
-              <button key={tb.id} onClick={() => setTab(tb.id)} style={{
-                padding: "8px 18px", borderRadius: 9,
-                fontSize: 13, fontWeight: 700, fontFamily: "inherit", cursor: "pointer",
-                background: tab === tb.id ? `${t.blue}18` : "transparent",
-                color: tab === tb.id ? t.blue : t.sub,
-                border: `1px solid ${tab === tb.id ? `${t.blue}44` : "transparent"}`,
-                transition: "all 0.15s",
-              }}>
-                {tb.label}
-                {tb.count != null && <span style={{ marginLeft: 6, fontSize: 11, opacity: 0.7 }}>({tb.count})</span>}
-              </button>
-            ))}
+          {TABS.filter(tb => !tb.hidden).map(tb => (
+            <button key={tb.id} onClick={() => setTab(tb.id)} style={{
+              padding: "8px 18px", borderRadius: 9,
+              fontSize: 13, fontWeight: 700, fontFamily: "inherit", cursor: "pointer",
+              background: tab === tb.id ? `${t.blue}18` : "transparent",
+              color: tab === tb.id ? t.blue : t.sub,
+              border: `1px solid ${tab === tb.id ? `${t.blue}44` : "transparent"}`,
+              transition: "all 0.15s",
+            }}>
+              {tb.label}
+              {tb.count != null && <span style={{ marginLeft: 6, fontSize: 11, opacity: 0.7 }}>({tb.count})</span>}
+            </button>
+          ))}
           </div>
 
           {/* ── Clauses tab ── */}
@@ -592,30 +652,54 @@ export default function Analyzer({ t, toast, state, setState }) {
           {/* ── Insights tab (NEW) ── */}
           {tab === "insights" && (
             <div>
-              {/* Key numbers */}
               <Card t={t} style={{ marginBottom: 16 }}>
                 <KeyNumbersTable numbers={result.key_numbers} t={t} />
               </Card>
-
-              {/* Deadlines */}
               {result.deadlines?.length > 0 && (
                 <Card t={t} style={{ marginBottom: 16 }}>
                   <DeadlineAlerts deadlines={result.deadlines} t={t} />
                 </Card>
               )}
-
-              {/* Party obligations */}
               {result.party_obligations?.length > 0 && (
                 <Card t={t} style={{ marginBottom: 16 }}>
                   <PartyObligationMap obligations={result.party_obligations} t={t} />
                 </Card>
               )}
-
-              {/* Missing clauses */}
               <Card t={t}>
                 <MissingClausesPanel missing={result.missing_clauses} t={t} />
               </Card>
             </div>
+          )}
+
+          {/* ── Full Translation tab ── */}
+          {tab === "translation" && result.full_translation && (
+            <Card t={t}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 18, flexWrap: "wrap" }}>
+                <div style={{ width: 36, height: 36, borderRadius: 10, background: `${t.blue}18`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18 }}>🌍</div>
+                <div>
+                  <div style={{ fontWeight: 800, color: t.text, fontSize: 15 }}>Complete English Translation</div>
+                  <div style={{ fontSize: 12, color: t.muted, marginTop: 2 }}>
+                    Translated from {result.source_language} via {result.translation_engine === "gemini-2.5-flash" ? "Google Gemini (2.5 Flash)" : result.translation_engine}
+                    {result.translation_confidence ? ` · ${result.translation_confidence}% confidence` : ""}
+                  </div>
+                </div>
+              </div>
+              <div style={{ padding: "18px 20px", borderRadius: 10, background: t.surfaceUp, border: `1px solid ${t.border}`, maxHeight: 600, overflowY: "auto" }}>
+                <pre style={{ fontSize: 13, color: t.sub, lineHeight: 1.85, margin: 0, whiteSpace: "pre-wrap", fontFamily: "inherit" }}>
+                  {result.full_translation}
+                </pre>
+              </div>
+              {result.original_text && (
+                <div style={{ marginTop: 16 }}>
+                  <div style={{ fontSize: 11, fontWeight: 800, color: t.muted, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 10 }}>Original {result.source_language} Text</div>
+                  <div style={{ padding: "16px 20px", borderRadius: 10, background: t.bg, border: `1px solid ${t.border}`, maxHeight: 350, overflowY: "auto" }}>
+                    <pre style={{ fontSize: 13, color: t.muted, lineHeight: 1.85, margin: 0, whiteSpace: "pre-wrap", fontFamily: "inherit" }}>
+                      {result.original_text}
+                    </pre>
+                  </div>
+                </div>
+              )}
+            </Card>
           )}
 
           {/* ── Q&A tab (multi-turn + suggested questions) ── */}
@@ -694,19 +778,58 @@ export default function Analyzer({ t, toast, state, setState }) {
 
           {/* ── Case laws tab ── */}
           {tab === "caselaws" && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+
+              {/* Section Explanations panel */}
+              {result.section_explanations?.length > 0 && (
+                <Card t={t}>
+                  <SectionTitle t={t}>Sections Charged — Plain English Explained</SectionTitle>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                    {result.section_explanations.map((sec, i) => (
+                      <div key={i} style={{ padding: "14px 16px", borderRadius: 10, background: `${t.blue}08`, border: `1px solid ${t.blue}25` }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
+                          <span style={{ fontSize: 11, fontWeight: 900, color: t.blue, background: `${t.blue}18`, border: `1px solid ${t.blue}30`, borderRadius: 6, padding: "2px 10px", letterSpacing: "0.06em" }}>
+                            {sec.section}
+                          </span>
+                          <span style={{ fontWeight: 800, fontSize: 14, color: t.text }}>{sec.title}</span>
+                        </div>
+                        <p style={{ fontSize: 13, color: t.sub, lineHeight: 1.75, margin: "0 0 8px" }}>{sec.explanation}</p>
+                        {sec.punishment && (
+                          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                            <span style={{ fontSize: 10, fontWeight: 800, color: "#e05c5c", background: "#e05c5c12", border: "1px solid #e05c5c30", borderRadius: 4, padding: "1px 8px" }}>PUNISHMENT</span>
+                            <span style={{ fontSize: 12, color: "#e05c5c", fontWeight: 600 }}>{sec.punishment}</span>
+                          </div>
+                        )}
+                        {sec.key_elements?.length > 0 && (
+                          <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 6 }}>
+                            {sec.key_elements.map((el, j) => (
+                              <span key={j} style={{ fontSize: 11, color: t.muted, background: t.surfaceUp, border: `1px solid ${t.border}`, borderRadius: 4, padding: "2px 8px" }}>• {el}</span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </Card>
+              )}
+
+              {/* Case law results */}
               {validCaseLaws.length === 0 ? (
                 <Card t={t} style={{ textAlign: "center", padding: "40px 24px" }}>
                   <Ic d={ICONS.search} size={32} color={t.muted} />
                   <p style={{ color: t.sub, marginTop: 14, fontSize: 14, fontWeight: 600 }}>No relevant case laws found</p>
                   <p style={{ color: t.muted, fontSize: 12, marginTop: 6, lineHeight: 1.7 }}>
-                    Make sure <code style={{ background: t.surfaceUp, padding: "2px 6px", borderRadius: 4 }}>INDIANKANOON_API_KEY</code> is set in your .env,
-                    or the document may not have enough flagged content to build a relevant query.
+                    Make sure <code style={{ background: t.surfaceUp, padding: "2px 6px", borderRadius: 4 }}>INDIANKANOON_API_KEY</code> is set in your .env
                   </p>
                 </Card>
               ) : (
                 validCaseLaws.map((c, i) => (
                   <Card t={t} key={i} style={{ animation: `fadeUp 0.3s ease ${i * 0.06}s both` }}>
+                    {c.related_section && (
+                      <span style={{ fontSize: 10, fontWeight: 800, color: t.blue, background: `${t.blue}15`, border: `1px solid ${t.blue}30`, borderRadius: 4, padding: "2px 8px", display: "inline-block", marginBottom: 8 }}>
+                        Re: {c.related_section}
+                      </span>
+                    )}
                     <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
                       <p style={{ fontWeight: 800, fontSize: 14, color: t.text, margin: 0, lineHeight: 1.4 }}>{c.title}</p>
                       <div style={{ display: "flex", gap: 6 }}>

@@ -25,13 +25,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import fitz  # PyMuPDF
-import ollama
 import numpy as np
 from dotenv import load_dotenv
+from groq import Groq
 
 load_dotenv()
 
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+GROQ_MODEL  = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+_groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+def _groq_chat(prompt: str, temperature: float = 0.1, max_tokens: int = 512) -> str:
+    """Thin helper so we can swap models in one place."""
+    resp = _groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content.strip()
 
 # Try to import ChromaDB
 try:
@@ -239,15 +250,9 @@ Provide your response in this exact JSON format:
 If not found, set bns_section to "NOT_FOUND"."""
 
         try:
-            response = ollama.chat(
-                model=OLLAMA_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                options={"temperature": 0.1, "num_gpu": 99, "num_ctx": 2048}
-            )
-            
-            content = response["message"]["content"]
+            content = _groq_chat(prompt, temperature=0.1, max_tokens=256)
             json_match = re.search(r'\{.*\}', content, re.DOTALL)
-            
+
             if json_match:
                 result = json.loads(json_match.group())
                 mapped = {
@@ -259,7 +264,7 @@ If not found, set bns_section to "NOT_FOUND"."""
                 }
                 self.cache[cache_key] = mapped
                 return mapped
-                
+
         except Exception as e:
             print(f"[AI Mapping] Error: {e}")
         
@@ -553,12 +558,7 @@ CONCLUSION
 [What is the likely legal outcome? What should the complainant do?]"""
 
     try:
-        response = ollama.chat(
-            model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0.2, "num_ctx": 2048, "num_gpu": 99},
-        )
-        return response["message"]["content"].strip()
+        return _groq_chat(prompt, temperature=0.2, max_tokens=1024)
     except Exception as e:
         return f"Error generating IRAC analysis: {e}"
 
