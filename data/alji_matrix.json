@@ -1,0 +1,50 @@
+{
+  "rental_agreement": {
+    "Maharashtra": {
+      "central_laws": ["Transfer of Property Act, 1882", "Indian Contract Act, 1872"],
+      "state_laws": ["Maharashtra Rent Control Act, 1999", "MTA Framework Guidelines"],
+      "risk_parameters": {
+        "security_deposit_cap": "2 months rent for residential, 6 months for commercial (MTA & Section 24 MRC)",
+        "eviction_notice_min": "1 month (Section 16 MRC)",
+        "rent_increase_cap": "As per written agreement; 3 months written notice required for hike (MTA Guidelines)",
+        "overstay_penalty": "2x rent for first two months, 4x rent subsequently (MTA Guidelines)"
+      }
+    },
+    "Karnataka": {
+      "central_laws": ["Transfer of Property Act, 1882", "Indian Contract Act, 1872"],
+      "state_laws": ["Karnataka Rent Act, 2001", "MTA Framework Guidelines"],
+      "risk_parameters": {
+        "security_deposit_cap": "2 months rent for residential, 6 months for commercial (MTA Guidelines)",
+        "eviction_notice_min": "1 month (Section 27 KRA)",
+        "rent_increase_cap": "3 months written notice required for hike (MTA Guidelines)"
+      }
+    },
+    "Telangana": {
+      "central_laws": ["Transfer of Property Act, 1882", "Indian Contract Act, 1872"],
+      "state_laws": ["Telangana Buildings (Lease, Rent and Eviction) Control Act, 1960"],
+      "risk_parameters": {
+        "security_deposit_cap": "Usually equivalent to 2-3 months rent, though legally negotiable.",
+        "eviction_notice_min": "1 month written notice unless lease expires naturally.",
+        "rent_increase_cap": "Fair rent principles apply; unreasonable hikes can be contested via Rent Controller.",
+        "overstay_penalty": "Tenant holds over at their own risk; landlord can file for eviction and mesne profits."
+      }
+    }
+  },
+  "employment_contract": {
+    "Maharashtra": {
+      "central_laws": [
+        "Code on Wages, 2019", 
+        "Industrial Relations Code, 2020", 
+        "Code on Social Security, 2020", 
+        "Occupational Safety, Health and Working Conditions Code, 2020"
+      ],
+      "state_laws": ["Maharashtra Shops and Establishments Act, 2017"],
+      "risk_parameters": {
+        "wage_definition": "Basic + DA must be at least 50% of total CTC (Code on Wages)",
+        "gratuity_eligibility": "1 year for Fixed-Term Employees, 5 years for permanent (Code on Social Security)",
+        "leave_entitlement": "Eligible for annual leave after 180 days of work (OSHWC Code)",
+        "max_working_hours": "9 hours/day, 48 hours/week (Maharashtra Shops Act & OSHWC Code)"
+      }
+    }
+  }
+}

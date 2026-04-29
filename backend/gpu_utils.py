@@ -48,7 +48,7 @@ def setup_gpu() -> torch.device:
     - Returns the torch.device to use everywhere
     """
     if not torch.cuda.is_available():
-        print("[GPU] ⚠️  CUDA not available. Running on CPU.")
+        print("[GPU] WARNING: CUDA not available. Running on CPU.")
         print("[GPU]     Make sure you installed CUDA PyTorch:")
         print("[GPU]     pip install torch --index-url https://download.pytorch.org/whl/cu121")
         return torch.device("cpu")
@@ -56,7 +56,7 @@ def setup_gpu() -> torch.device:
     nvidia_idx = _find_nvidia_device()
 
     if nvidia_idx == -1:
-        print("[GPU] ⚠️  No NVIDIA GPU found. Running on CPU.")
+        print("[GPU] WARNING: No NVIDIA GPU found. Running on CPU.")
         return torch.device("cpu")
 
     # Lock CUDA to only see the NVIDIA GPU
@@ -74,7 +74,7 @@ def setup_gpu() -> torch.device:
     # Print GPU info
     props = torch.cuda.get_device_properties(device)
     vram_gb = props.total_memory / 1024**3
-    print(f"[GPU] ✅ Using: {props.name}")
+    print(f"[GPU] OK Using: {props.name}")
     print(f"[GPU]    VRAM:        {vram_gb:.1f} GB")
     print(f"[GPU]    CUDA:        {props.major}.{props.minor}")
     print(f"[GPU]    Multiproc:   {props.multi_processor_count}")

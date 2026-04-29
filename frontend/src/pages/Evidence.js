@@ -114,16 +114,29 @@ const Countdown = ({ seconds, onExpire, t }) => {
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default function Evidence({ t, toast, state, setState }) {
+  // Persisted across navigation via parent state
+  const setS = (key, val) => setState(s => ({ ...s, [key]: val }));
+  const step          = state.step          ?? 0;
+  const cert          = state.cert          ?? null;
+  const name          = state.name          ?? "";
+  const phone         = state.phone         ?? "";
+  const address       = state.address       ?? "";
+  const brief         = state.brief         ?? "";
+  const incDate       = state.incDate       ?? "";
+  const policeStation = state.policeStation ?? "";
+
+  const setStep          = v => setS("step", v);
+  const setCert          = v => setS("cert", v);
+  const setName          = v => setS("name", v);
+  const setPhone         = v => setS("phone", v);
+  const setAddress       = v => setS("address", v);
+  const setBrief         = v => setS("brief", v);
+  const setIncDate       = v => setS("incDate", v);
+  const setPoliceStation = v => setS("policeStation", v);
+
+  // Local-only state (file/preview blobs can't be serialized)
   const [file, setFile] = useState(null);
   const [prev, setPrev] = useState(null);
-  const [name, setName] = useState("");
-  const [phone, setPhone] = useState("");
-  const [address, setAddress] = useState("");
-  const [brief, setBrief] = useState("");
-  const [incDate, setIncDate] = useState("");
-  const [policeStation, setPoliceStation] = useState("");
-  const [step, setStep] = useState(0);
-  const [cert, setCert] = useState(null);
 
   const [otpSent, setOtpSent] = useState(false);
   const [otpValue, setOtpValue] = useState("");
@@ -131,11 +144,12 @@ export default function Evidence({ t, toast, state, setState }) {
   const [otpExpired, setOtpExpired] = useState(false);
   const [otpLoading, setOtpLoading] = useState(false);
   const [verifyLoading, setVerifyLoading] = useState(false);
-  const [dlLoading, setDlLoading] = useState(false);   // NEW
+  const [dlLoading, setDlLoading] = useState(false);
 
   const [load, setLoad] = useState(false);
   const [err, setErr] = useState(null);
   const fileRef = useRef();
+
 
   const pickFile = (f) => {
     if (!f) return;
@@ -229,10 +243,12 @@ export default function Evidence({ t, toast, state, setState }) {
   };
 
   const reset = () => {
-    setFile(null); setPrev(null); setName(""); setPhone(""); setAddress("");
-    setBrief(""); setIncDate(""); setPoliceStation(""); setStep(0); setCert(null);
+    setFile(null); setPrev(null); setErr(null);
     setOtpSent(false); setOtpValue(""); setOtpVerified(false); setOtpExpired(false);
-    setErr(null);
+    setState({
+      step: 0, cert: null, name: "", phone: "", address: "",
+      brief: "", incDate: "", policeStation: "",
+    });
   };
 
   const hash = cert?.sha256_hash || cert?.sha256 || "";

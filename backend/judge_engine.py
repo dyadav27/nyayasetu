@@ -6,14 +6,15 @@ Nyaya-Setu | Team IKS | SPIT CSE 2025-26
 import os, sys, json, re
 sys.path.append(os.path.dirname(__file__))
 
-import ollama
+from groq import Groq
 from dotenv import load_dotenv
 from gpu_utils import DEVICE
 from lex_validator import verify_citations, format_irac
 
 load_dotenv()
 
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 KB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "legal_kb.json")
 
 
@@ -58,17 +59,13 @@ def format_kb_context(offences: list[dict]) -> str:
 
 # ── LLM call ──────────────────────────────────────────────────────────────────
 def call_llm(messages: list[dict]) -> str:
-    response = ollama.chat(
-        model=OLLAMA_MODEL,
+    response = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
         messages=messages,
-        options={
-            "temperature": 0.3,
-            "num_ctx":     4096,
-            "num_gpu":     99,
-            "num_thread":  4,
-        },
+        temperature=0.3,
+        max_tokens=4096,
     )
-    return response["message"]["content"].strip()
+    return response.choices[0].message.content.strip()
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
