@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 legal_translator.py — Legal Document Translation for Nyaya-Setu
-Nyaya-Setu | Team IKS | SPIT CSE 2025-26
+NyayaSetu | Team IKS | SPIT CSE 2025-26
 
 Translation Priority:
-  1. LOCAL NLLB model  (hf_models/nllb_model — no API, offline, ~4-6s/page)
-  2. Google Gemini 2.5 Flash  (if NLLB fails, chunked for large docs)
+  1. Colab NLLB model  (via local_models.py HTTP client — no local GPU needed)
+  2. Google Gemini 2.5 Flash  (if Colab/NLLB unavailable, chunked for large docs)
   3. Groq Llama 3.3 70B       (final fallback)
 
 Language Detection : Unicode script range → Groq LLM confirmation
@@ -18,7 +18,6 @@ Supports: Marathi, Hindi, Tamil, Telugu, Kannada, Bengali, Gujarati,
 
 import os, re, json, time as _time
 import sys
-# Allow imports from backend/ when called from modules/
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from groq import Groq
 from dotenv import load_dotenv
@@ -33,18 +32,11 @@ GROQ_MODEL     = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL   = "gemini-2.5-flash"
 
-# Max source chars per Gemini call — keeps output within the 16 384-token limit
 GEMINI_CHUNK_CHARS = 30_000
 
-# Dedicated translation model — always use the 70b model regardless of
-# GROQ_MODEL env var (which may be set to the fast/cheap 8b model).
-# llama-3.3-70b-versatile has 12 000 TPM on free tier.
-GROQ_TRANSLATION_MODEL = "llama-3.3-70b-versatile"
-# Max chars per Groq translation chunk — 2500 chars ≈ 3 000 tokens,
-# safely under the 6 000 TPM limit even for the smallest free-tier model.
+GROQ_TRANSLATION_MODEL     = "llama-3.3-70b-versatile"
 GROQ_TRANSLATE_CHUNK_CHARS = 2500
 
-# Single Gemini client instance (None if no key)
 _gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # ── Language tables ───────────────────────────────────────────────────────────
@@ -81,7 +73,6 @@ SCRIPT_RANGES = {
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 def _split_into_chunks(text: str, max_chars: int) -> list[str]:
-    """Split text into chunks at newline / sentence boundaries."""
     lines = text.split("\n")
     chunks, current = [], ""
     for line in lines:
@@ -110,7 +101,6 @@ def _split_into_chunks(text: str, max_chars: int) -> list[str]:
 
 
 def _groq_call(prompt: str, max_tokens: int = 1200, temperature: float = 0.1) -> str:
-    """Raw Groq call with basic error handling."""
     resp = groq_client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -122,7 +112,6 @@ def _groq_call(prompt: str, max_tokens: int = 1200, temperature: float = 0.1) ->
 
 # ── Language detection ────────────────────────────────────────────────────────
 def detect_script(text: str) -> str:
-    """Unicode-range script detection. Returns ISO 639-1 code."""
     counts: dict[str, int] = {}
     for ch in text:
         cp = ord(ch)
@@ -135,7 +124,6 @@ def detect_script(text: str) -> str:
 
 
 def detect_language_with_llm(text: str) -> dict:
-    """Use Groq LLM to precisely identify language (Hindi vs Marathi etc.)."""
     sample = text[:500]
     prompt = (
         "Identify the language of this Indian legal document text.\n"
@@ -176,11 +164,6 @@ _GEMINI_SYSTEM_PROMPT = (
 
 
 def _gemini_call_single(chunk: str, src_lang: str, tgt_lang: str) -> str:
-    """
-    Translate one chunk via Gemini with 3-retry exponential backoff.
-    Handles transient 503 / rate-limit errors before giving up.
-    Raises ValueError only on non-retryable failure.
-    """
     src_name = GEMINI_LANGS.get(src_lang, src_lang)
     tgt_name = GEMINI_LANGS.get(tgt_lang, tgt_lang)
     user_prompt = (
@@ -190,7 +173,7 @@ def _gemini_call_single(chunk: str, src_lang: str, tgt_lang: str) -> str:
     )
 
     last_err = None
-    for attempt in range(1, 4):          # up to 3 attempts
+    for attempt in range(1, 4):
         try:
             response = _gemini_client.models.generate_content(
                 model=GEMINI_MODEL,
@@ -208,25 +191,18 @@ def _gemini_call_single(chunk: str, src_lang: str, tgt_lang: str) -> str:
         except Exception as e:
             last_err = e
             msg = str(e)
-            # Retry on transient server errors (503, 429, 500)
             if any(code in msg for code in ("503", "429", "500", "UNAVAILABLE", "rate_limit")):
-                wait = 5 * attempt   # 5 s, 10 s, 15 s
+                wait = 5 * attempt
                 print(f"[TRANSLATOR] Gemini transient error (attempt {attempt}/3): {msg[:80]}. "
                       f"Retrying in {wait}s...")
                 _time.sleep(wait)
             else:
-                break   # non-retryable error — give up immediately
+                break
 
     raise ValueError(f"Gemini failed after retries: {last_err}")
 
 
 def _gemini_translate(text: str, src_lang: str, tgt_lang: str) -> tuple[str, float]:
-    """
-    Translate an arbitrarily large document using Gemini.
-    Splits into GEMINI_CHUNK_CHARS chunks so output is never silently truncated.
-    Returns (full_translated_text, confidence).
-    Raises ValueError on failure → caller falls back to Groq.
-    """
     if not _gemini_client:
         raise ValueError("GEMINI_API_KEY not set in .env")
 
@@ -260,11 +236,6 @@ def _gemini_translate(text: str, src_lang: str, tgt_lang: str) -> tuple[str, flo
 
 # ── Groq fallback translation ─────────────────────────────────────────────────
 def _groq_translate(text: str, src_name: str, tgt_name: str, document_type: str) -> tuple[str, float]:
-    """
-    Full translation via Groq — used only when Gemini is unavailable.
-    Always uses GROQ_TRANSLATION_MODEL (llama-3.3-70b-versatile, 12k TPM)
-    with small chunks (GROQ_TRANSLATE_CHUNK_CHARS ≈ 2500) to avoid 413 errors.
-    """
     if len(text) > GROQ_TRANSLATE_CHUNK_CHARS:
         chunks = _split_into_chunks(text, GROQ_TRANSLATE_CHUNK_CHARS)
         print(f"[TRANSLATOR] Groq fallback: {len(text)} chars -> {len(chunks)} chunks")
@@ -274,7 +245,6 @@ def _groq_translate(text: str, src_name: str, tgt_name: str, document_type: str)
             if t:
                 parts.append(t)
             min_conf = min(min_conf, c)
-            # Small pause between chunks to respect TPM
             if i < len(chunks):
                 _time.sleep(2)
         return "\n\n".join(parts), min_conf
@@ -302,7 +272,6 @@ def _groq_translate(text: str, src_name: str, tgt_name: str, document_type: str)
 
 # ── Post-processing helpers ───────────────────────────────────────────────────
 def _extract_legal_terms(original: str, translated: str, src_name: str) -> list[str]:
-    """Extract key legal terms from the full document (samples beginning+middle+end)."""
     def _sample(t: str, total: int = 2400) -> str:
         if len(t) <= total:
             return t
@@ -329,10 +298,6 @@ def _extract_legal_terms(original: str, translated: str, src_name: str) -> list[
 
 
 def _generate_fir_summary(translated_text: str, src_name: str) -> str:
-    """
-    Structured 8-point summary of the ENTIRE translated FIR.
-    Feeds up to 6 000 chars to avoid Groq 413 token limit errors.
-    """
     body = translated_text[:6_000]
     prompt = (
         f"You are an expert Indian legal analyst. The following is the COMPLETE English translation "
@@ -360,18 +325,9 @@ def _generate_fir_summary(translated_text: str, src_name: str) -> str:
 
 # ── Shared result builders ────────────────────────────────────────────────────
 def _ok_result(
-    translated_text: str,
-    fir_summary: str,
-    source_lang: str,
-    src_name: str,
-    target_lang: str,
-    tgt_name: str,
-    legal_terms: list,
-    confidence: float,
-    detection_confidence: float,
-    notes: str,
-    engine: str,
-    original_char_count: int,
+    translated_text, fir_summary, source_lang, src_name,
+    target_lang, tgt_name, legal_terms, confidence,
+    detection_confidence, notes, engine, original_char_count,
 ) -> dict:
     return {
         "translated_text":       translated_text,
@@ -417,8 +373,12 @@ def translate_legal_text(
     document_type: str = "FIR / Police Complaint",
 ) -> dict:
     """
-    Translate an entire legal document using Google Gemini (primary) with Groq
-    fallback. Large documents are chunked automatically — no truncation.
+    Translate an entire legal document.
+
+    Priority:
+      1. Colab NLLB (via local_models.translate_chunks_nllb → HTTP)
+      2. Google Gemini 2.5 Flash
+      3. Groq Llama 3.3 70B
 
     Returns a dict with keys:
         translated_text, fir_summary, source_language, source_language_name,
@@ -458,27 +418,32 @@ def translate_legal_text(
             original_char_count=len(text),
         )
 
-    # ── Step 2: Translate (LOCAL NLLB -> Gemini -> Groq) ───────────────────────
+    # ── Step 2: Translate (Colab NLLB → Gemini → Groq) ────────────────────────
     translated_text, confidence, engine, notes = "", 0.0, "error", ""
 
-    # ── 2a. Try local NLLB model first (no API, fastest, no cost) ─────────────
-    if source_lang in ("hi", "mr", "ta", "te", "kn", "bn", "gu", "ml", "pa", "or", "as", "ur"):
+    # ── 2a. Try Colab NLLB (fastest, no API cost) ─────────────────────────────
+    from local_models import translate_chunks_nllb, NLLB_LANG_MAP
+    if source_lang in NLLB_LANG_MAP and target_lang in NLLB_LANG_MAP:
         try:
-            from local_models import translate_chunks_nllb, NLLB_LANG_MAP
-            if source_lang in NLLB_LANG_MAP and target_lang in NLLB_LANG_MAP:
-                print(f"[TRANSLATOR] Using local NLLB model ({src_name} -> {tgt_name})...")
-                translated_text = translate_chunks_nllb(
-                    text, src_lang=source_lang, tgt_lang=target_lang
-                )
+            print(f"[TRANSLATOR] Using Colab NLLB ({src_name} -> {tgt_name})...")
+            translated_text = translate_chunks_nllb(
+                text, src_lang=source_lang, tgt_lang=target_lang
+            )
+            if translated_text:
                 confidence = 88.0
-                engine     = "nllb-local"
-                notes      = f"Translated offline using local NLLB-200 model · {src_name} -> {tgt_name}"
-                print(f"[TRANSLATOR] NLLB OK — {len(translated_text)} chars")
+                engine     = "nllb-colab"
+                notes      = (
+                    f"Translated via Colab NLLB-200 model · "
+                    f"{src_name} -> {tgt_name}"
+                )
+                print(f"[TRANSLATOR] Colab NLLB OK — {len(translated_text)} chars")
+            else:
+                print("[TRANSLATOR] Colab NLLB returned empty — trying Gemini...")
         except Exception as nllb_err:
-            print(f"[TRANSLATOR] NLLB failed ({nllb_err}), trying Gemini...")
+            print(f"[TRANSLATOR] Colab NLLB failed ({nllb_err}), trying Gemini...")
             translated_text = ""
 
-    # ── 2b. Fallback to Gemini if NLLB unavailable or failed ──────────────────
+    # ── 2b. Fallback to Gemini ─────────────────────────────────────────────────
     if not translated_text:
         engine = GEMINI_MODEL
         notes  = f"Translated using Google Gemini ({GEMINI_MODEL}) · {src_name} -> {tgt_name}"
@@ -488,7 +453,9 @@ def translate_legal_text(
             print(f"[TRANSLATOR] Gemini failed ({e}), falling back to Groq ({GROQ_MODEL})...")
             engine = f"groq-{GROQ_MODEL}"
             notes  = f"Gemini unavailable — used Groq fallback ({GROQ_MODEL}) · {src_name} -> {tgt_name}"
-            translated_text, confidence = _groq_translate(text, src_name, tgt_name, document_type)
+            translated_text, confidence = _groq_translate(
+                text, src_name, tgt_name, document_type
+            )
             if not translated_text:
                 return _error_result(source_lang, target_lang, f"All engines failed: {e}")
 
@@ -519,7 +486,6 @@ def translate_legal_text(
 
 # ── Convenience wrappers ──────────────────────────────────────────────────────
 def translate_fir(text: str, source_lang: str = None) -> dict:
-    """Convenience wrapper specifically for FIR translation."""
     return translate_legal_text(
         text=text,
         source_lang=source_lang,
@@ -528,7 +494,6 @@ def translate_fir(text: str, source_lang: str = None) -> dict:
 
 
 def get_supported_languages() -> list[dict]:
-    """Return list of supported languages for the frontend dropdown."""
     return [
         {"code": code, "name": name}
         for code, name in SUPPORTED_LANGUAGES.items()
@@ -543,19 +508,15 @@ if __name__ == "__main__":
     पोलीस ठाणे: अंधेरी पूर्व, मुंबई
 
     फिर्यादी: श्री. राजेश पाटील, वय ३५ वर्षे
-    पत्ता: फ्लॅट नं. ४०२, साई अपार्टमेंट, अंधेरी पूर्व
-
-    आरोपी: अज्ञात व्यक्ती (२ जण)
 
     घटनेचा तपशील:
-    दिनांक १५/०३/२०२५ रोजी रात्री ९:३० वाजता मी अंधेरी स्टेशन जवळून
-    चालत जात असताना दोन अज्ञात व्यक्तींनी माझा मोबाईल फोन (Samsung Galaxy S24,
-    किंमत ₹७९,९९९) हिसकावून घेतला आणि बाईकवरून पळून गेले.
+    दिनांक १५/०३/२०२५ रोजी रात्री ९:३० वाजता दोन अज्ञात व्यक्तींनी
+    माझा मोबाईल फोन हिसकावून घेतला.
 
-    कलम: भारतीय न्याय संहिता (BNS) कलम ३०४ — चोरी
+    कलम: भारतीय न्याय संहिता (BNS) कलम ३०४
     """
 
-    print("Testing legal translation (Marathi -> English) via Gemini + Groq fallback...")
+    print("Testing Colab NLLB → Gemini → Groq translation pipeline...")
     result = translate_fir(sample_marathi)
     SEP = "=" * 60
     print(f"\n{SEP}")
@@ -565,8 +526,4 @@ if __name__ == "__main__":
     print(f"Chars (orig/trans) : {result['char_count_original']} / {result['char_count_translated']}")
     print(f"\n── Full Translation {'─'*40}")
     print(result["translated_text"])
-    print(f"\n── Structured FIR Summary {'─'*34}")
-    print(result["fir_summary"])
-    print(f"\n── Legal Terms {'─'*45}")
-    print(result["legal_terms_preserved"])
     print(f"\nNotes: {result['notes']}")

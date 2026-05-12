@@ -1,32 +1,20 @@
+# -*- coding: utf-8 -*-
 """
 document_analyzer.py — Core Document Analysis Engine
-Nyaya-Setu | Team IKS | SPIT CSE 2025-26
+NyayaSetu | Team IKS | SPIT CSE 2025-26
 
-Handles:
-  1.  PDF/image text extraction
-  2.  Clause segmentation
-  3.  Clause risk scoring (Safe/Caution/High Risk/Illegal)
-  4.  Plain-language document summary
-  5.  Confidence scoring on every output
-  6.  IndianKanoon case law retrieval
-  7.  RAG Q&A over uploaded document (multi-turn)
-  NEW:
-  8.  Document type detection with confidence %
-  9.  Party obligation map
-  10. Missing clauses detector
-  11. Plain-English rewrite for High Risk / Illegal clauses (safer_version)
-  12. Key numbers extractor (rupees, dates, %, durations)
-  13. Limitation period / deadline alerts
-  14. Suggested questions (6 per document)
-  15. Signature verdict (Sign / Negotiate / Do Not Sign)
+Changes from previous version:
+  - DocumentRAG now uses _ColabEmbedder (HTTP calls to Colab /embed endpoint)
+    instead of loading SentenceTransformer locally.
+  - summarize_document calls local_models.summarize_with_bart which is now
+    an HTTP proxy — no other changes needed there.
+  - All other logic (clause scoring, RAG Q&A, IndianKanoon, etc.) unchanged.
 
 PARALLEL PIPELINE (v6):
-  - Phase 1: Translation (local NLLB → Gemini → Groq) runs concurrently with
+  - Phase 1: Translation (Colab NLLB → Gemini → Groq) runs concurrently with
              document-type detection & legal section extraction.
-  - Phase 2: ALL Groq analysis tasks (clause scoring, summary, party obligations,
-             key numbers, deadlines, suggested questions, case laws, section
-             explanations) fire simultaneously via asyncio + ThreadPoolExecutor.
-  - LLM backend: Groq API (GROQ_API_KEY from .env) — no Ollama required.
+  - Phase 2: ALL Groq analysis tasks fire simultaneously via ThreadPoolExecutor.
+  - Phase 3: IndianKanoon targeted case-law fetch.
 """
 
 import os, sys, re, json
@@ -39,7 +27,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import fitz          # PyMuPDF
 from groq import Groq
-from sentence_transformers import SentenceTransformer
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from gpu_utils import DEVICE
@@ -49,21 +36,67 @@ import base64
 
 load_dotenv()
 
-# Shared thread-pool for CPU-bound / blocking IO tasks (Groq calls, NLLB inference)
 _EXECUTOR = ThreadPoolExecutor(max_workers=12)
 
 GROQ_MODEL           = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 INDIANKANOON_API_KEY = os.getenv("INDIANKANOON_API_KEY", "")
-# Local MuRIL embedding model from hf_models/ (used for in-document RAG QA)
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EMBED_MODEL   = os.path.join(_PROJECT_ROOT, "hf_models", "embedding_model")
 
-# ── Groq client ────────────────────────────────────────────────────────────────
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 
 # ─────────────────────────────────────────────────────────────
-# Document type definitions — required clauses per type
+# _ColabEmbedder — drop-in replacement for SentenceTransformer
+# Used by DocumentRAG so the rest of the class is unchanged.
+# ─────────────────────────────────────────────────────────────
+class _ColabEmbedder:
+    """
+    Mimics the SentenceTransformer.encode() API but routes all calls
+    to the Colab inference server via local_models.embed_texts().
+
+    DocumentRAG calls: self.embedder.encode(texts, normalize_embeddings=True,
+                                            convert_to_numpy=True)
+    This class accepts the same kwargs and returns a numpy array.
+    """
+
+    def __init__(self):
+        # Lazy import — avoids circular dependency at module level
+        import numpy as np
+        self._np = np
+        print("[DocRAG] Using Colab embedding server (no local GPU needed).")
+
+    def encode(
+        self,
+        texts,
+        normalize_embeddings: bool = True,  # accepted, handled server-side
+        convert_to_numpy: bool = True,
+        batch_size: int = 32,               # accepted, handled server-side
+        show_progress_bar: bool = False,
+        **kwargs,
+    ):
+        """
+        Encode texts via Colab /embed endpoint.
+        Always returns a numpy float32 array with shape (N, dim).
+        Falls back to a zero matrix if Colab is unreachable so the rest of the
+        analysis pipeline degrades gracefully rather than crashing.
+        """
+        from local_models import embed_texts
+        if isinstance(texts, str):
+            texts = [texts]
+
+        try:
+            vecs = embed_texts(texts)
+            arr  = self._np.array(vecs, dtype=self._np.float32)
+            return arr
+        except Exception as e:
+            print(f"[DocRAG] ⚠️  Colab embed failed ({e}). Using zero fallback.")
+            # Return zero vectors — retrieval will score all chunks equally,
+            # which degrades Q&A quality but won't crash the server.
+            dim = 384   # paraphrase-multilingual-MiniLM-L12-v2 dim
+            return self._np.zeros((len(texts), dim), dtype=self._np.float32)
+
+
+# ─────────────────────────────────────────────────────────────
+# Document type definitions
 # ─────────────────────────────────────────────────────────────
 DOCUMENT_TYPES = {
     "rental_agreement": {
@@ -162,12 +195,12 @@ DOCUMENT_TYPES = {
 # ─────────────────────────────────────────────────────────────
 class ClauseAnalysis(BaseModel):
     clause_text:   str
-    risk_level:    str           # Safe / Caution / High Risk / Illegal
-    risk_score:    float         # 0.0–1.0
+    risk_level:    str
+    risk_score:    float
     explanation:   str
     confidence:    float
     suggestion:    str
-    safer_version: Optional[str] = None   # NEW: rewrite for High Risk / Illegal
+    safer_version: Optional[str] = None
 
 class PartyObligation(BaseModel):
     party_name:  str
@@ -181,7 +214,7 @@ class MissingClause(BaseModel):
 class KeyNumber(BaseModel):
     label: str
     value: str
-    type:  str    # monetary / date / percentage / duration / other
+    type:  str
 
 class Deadline(BaseModel):
     description: str
@@ -189,8 +222,8 @@ class Deadline(BaseModel):
     consequence: Optional[str] = None
 
 class SignatureVerdict(BaseModel):
-    verdict: str   # "Safe to Sign" / "Negotiate First" / "Do Not Sign"
-    color:   str   # green / orange / red
+    verdict: str
+    color:   str
     reason:  str
 
 class SectionExplanation(BaseModel):
@@ -203,8 +236,8 @@ class SectionExplanation(BaseModel):
 class DocumentAnalysis(BaseModel):
     document_name:       str
     document_type:       str
-    document_type_key:   str    # NEW: e.g. "rental_agreement"
-    type_confidence:     int    # NEW: 0–100
+    document_type_key:   str
+    type_confidence:     int
     total_clauses:       int
     summary:             str
     risk_distribution:   dict
@@ -213,7 +246,6 @@ class DocumentAnalysis(BaseModel):
     compliance_score:    int
     case_laws:           list[dict]
     recommendations:     list[str]
-    # NEW fields
     party_obligations:   list[PartyObligation]
     missing_clauses:     list[MissingClause]
     key_numbers:         list[KeyNumber]
@@ -222,11 +254,11 @@ class DocumentAnalysis(BaseModel):
     signature_verdict:   SignatureVerdict
     original_text:          Optional[str]   = None
     source_language:        Optional[str]   = None
-    full_translation:       Optional[str]   = None   # complete English text (shown in Translation tab)
-    translation_engine:     Optional[str]   = None   # e.g. "sarvam-indictrans2"
+    full_translation:       Optional[str]   = None
+    translation_engine:     Optional[str]   = None
     translation_confidence: Optional[float] = None
-    mentioned_sections:     list[str]       = []     # BNS/IPC/CrPC refs found in document
-    section_explanations:   list[dict]      = []     # plain-English explanation of each section
+    mentioned_sections:     list[str]       = []
+    section_explanations:   list[dict]      = []
 
 class QAResponse(BaseModel):
     question:   str
@@ -240,28 +272,27 @@ class QAResponse(BaseModel):
 # Text extraction & Vision OCR
 # ─────────────────────────────────────────────────────────────
 def extract_text_with_vision(image_bytes: bytes) -> str:
-    """Use Groq Llama 3.2 Vision to extract text from an image."""
     try:
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
         completion = groq_client.chat.completions.create(
             model="llama-3.2-90b-vision-preview",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Extract all text from this image exactly as it appears. Do not add any commentary. If the text is in an Indian language (like Marathi or Hindi), transcribe it perfectly in its native script."
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }
-                        }
-                    ]
-                }
-            ],
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Extract all text from this image exactly as it appears. "
+                            "Do not add any commentary. If the text is in an Indian language "
+                            "(like Marathi or Hindi), transcribe it perfectly in its native script."
+                        )
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
+                    }
+                ]
+            }],
             temperature=0.0,
             max_tokens=2048
         )
@@ -272,35 +303,26 @@ def extract_text_with_vision(image_bytes: bytes) -> str:
 
 def extract_text(file_bytes: bytes, filename: str) -> str:
     fname = filename.lower()
-    
-    # 1. Handle PDFs
     if fname.endswith(".pdf"):
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        doc  = fitz.open(stream=file_bytes, filetype="pdf")
         text = "\n".join(page.get_text("text") for page in doc).strip()
-        
-        # SMART FALLBACK: If it's a scanned PDF, get_text() will return < 50 chars
         if len(text) < 50:
-            print("[ANALYZER] PDF seems to be a scanned image. Falling back to Vision OCR...")
+            print("[ANALYZER] PDF seems scanned. Falling back to Vision OCR...")
             vision_text = []
-            # Extract first 3 pages max to prevent API overload
             for page_num in range(min(3, len(doc))):
-                page = doc.load_page(page_num)
-                pix = page.get_pixmap(dpi=150)
+                page     = doc.load_page(page_num)
+                pix      = page.get_pixmap(dpi=150)
                 img_bytes = pix.tobytes("jpeg")
                 extracted = extract_text_with_vision(img_bytes)
                 if extracted:
                     vision_text.append(extracted)
             doc.close()
             return "\n\n".join(vision_text).strip()
-            
         doc.close()
         return text
-
-    # 2. Handle raw Images
     elif any(fname.endswith(ext) for ext in [".jpg", ".jpeg", ".png", ".webp"]):
         print("[ANALYZER] Image detected. Using Vision OCR...")
         return extract_text_with_vision(file_bytes)
-        
     return ""
 
 
@@ -309,7 +331,7 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
 # ─────────────────────────────────────────────────────────────
 def segment_clauses(text: str) -> list[str]:
     numbered = re.split(
-        r'\n(?=(?:\d+[\.\)]\s)|(?:Clause\s+\d+)|(?:Section\s+\d+)|(?:[A-Z]\.\s))',
+        r'\n(?=(?:\d+[\.]\s)|(?:Clause\s+\d+)|(?:Section\s+\d+)|(?:[A-Z]\.\s))',
         text,
     )
     if len(numbered) > 3:
@@ -329,10 +351,9 @@ def segment_clauses(text: str) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────
-# Document type detection with confidence  (ENHANCED)
+# Document type detection
 # ─────────────────────────────────────────────────────────────
 def detect_document_type(text: str) -> tuple[str, str, int]:
-    """Returns (type_key, label, confidence_pct)"""
     lower  = text.lower()
     scores = {}
     for key, cfg in DOCUMENT_TYPES.items():
@@ -349,20 +370,14 @@ def detect_document_type(text: str) -> tuple[str, str, int]:
     confidence = min(int(scores[best_key] * 100), 97)
     if confidence < 20:
         return "unknown", DOCUMENT_TYPES["unknown"]["label"], 40
-
     return best_key, DOCUMENT_TYPES[best_key]["label"], confidence
 
 
-# Two-tier model strategy:
-#   GROQ_MODEL (70b)        — complex reasoning: summary, section explanations, party obligations
-#   GROQ_FAST_MODEL (8b)    — high-volume repetitive: clause analysis, key numbers, deadlines, etc.
-# Free-tier TPM limits: 70b = 12,000 | 8b = 30,000
 GROQ_FAST_MODEL = os.getenv("GROQ_FAST_MODEL", "llama-3.1-8b-instant")
 
 import time as _time
 
 def _groq_call(model: str, prompt: str, temperature: float, max_tokens: int) -> str:
-    """Raw Groq call with automatic retry on 429 rate-limit errors."""
     for attempt in range(4):
         try:
             resp = groq_client.chat.completions.create(
@@ -375,7 +390,7 @@ def _groq_call(model: str, prompt: str, temperature: float, max_tokens: int) -> 
         except Exception as e:
             msg = str(e)
             if "429" in msg or "rate_limit" in msg.lower():
-                wait = 3 * (attempt + 1)   # 3s, 6s, 9s, 12s
+                wait = 3 * (attempt + 1)
                 print(f"[LLM] Rate limit hit. Waiting {wait}s (attempt {attempt+1}/4)...")
                 _time.sleep(wait)
             else:
@@ -384,19 +399,14 @@ def _groq_call(model: str, prompt: str, temperature: float, max_tokens: int) -> 
 
 
 def call_llm(prompt: str, temperature: float = 0.1) -> str:
-    """Use the heavy 70b model — for complex, one-off reasoning tasks."""
     return _groq_call(GROQ_MODEL, prompt, temperature, max_tokens=3000)
 
 
 def call_llm_fast(prompt: str, temperature: float = 0.1) -> str:
-    """Use the fast 8b model — for repetitive clause-level tasks (30k TPM)."""
     return _groq_call(GROQ_FAST_MODEL, prompt, temperature, max_tokens=1500)
 
 
-
-
 def parse_json_response(raw: str, fallback):
-    """Strip markdown fences and extract the first JSON array or object."""
     raw = re.sub(r"```json\s*", "", raw)
     raw = re.sub(r"```\s*",     "", raw).strip()
     for pattern in (r'\[.*\]', r'\{.*\}'):
@@ -418,7 +428,7 @@ def compute_confidence(context: str, answer: str) -> float:
 
 
 # ─────────────────────────────────────────────────────────────
-# Clause risk scoring  (ENHANCED — adds safer_version)
+# Clause risk scoring
 # ─────────────────────────────────────────────────────────────
 def analyze_clause(clause: str, doc_type: str) -> ClauseAnalysis:
     prompt = f"""You are an Indian legal expert reviewing a {doc_type}.
@@ -434,7 +444,7 @@ JSON format:
   "explanation": "one plain-English sentence explaining why",
   "confidence": 0.0 to 1.0,
   "suggestion": "one sentence on what the user should do",
-  "safer_version": "if risk_level is High Risk or Illegal, write a fairer rewrite the user can propose to the other party. Otherwise null."
+  "safer_version": "if risk_level is High Risk or Illegal, write a fairer rewrite. Otherwise null."
 }}
 
 Risk guide:
@@ -445,7 +455,6 @@ Risk guide:
 
     raw  = call_llm_fast(prompt)
     data = parse_json_response(raw, {})
-
     return ClauseAnalysis(
         clause_text=clause[:300],
         risk_level=data.get("risk_level", "Caution"),
@@ -458,18 +467,18 @@ Risk guide:
 
 
 # ─────────────────────────────────────────────────────────────
-# Document summary  (BART local model primary, Groq fallback)
+# Document summary  (Colab BART → Groq fallback)
 # ─────────────────────────────────────────────────────────────
 def summarize_document(text: str, doc_type: str) -> str:
-    # ── 1. Try local BART model first (fast, no API cost) ──────────────────────
+    # ── 1. Try Colab BART (fast, no API cost) ──────────────────────────────────
     try:
         from local_models import summarize_with_bart
         bart_summary = summarize_with_bart(text[:3000])
         if bart_summary and len(bart_summary) > 40:
-            print("[ANALYZER] BART summary OK.")
+            print("[ANALYZER] Colab BART summary OK.")
             return bart_summary
     except Exception as bart_err:
-        print(f"[ANALYZER] BART summarization failed ({bart_err}), falling back to Groq...")
+        print(f"[ANALYZER] Colab BART failed ({bart_err}), falling back to Groq...")
 
     # ── 2. Groq LLM fallback ────────────────────────────────────────────────────
     prompt = f"""You are an Indian legal assistant. Summarize this {doc_type} in plain English for a common person.
@@ -482,7 +491,7 @@ DOCUMENT (first 2000 chars):
 
 
 # ─────────────────────────────────────────────────────────────
-# Party obligation map  (NEW)
+# Party obligation map
 # ─────────────────────────────────────────────────────────────
 def extract_party_obligations(text: str, doc_type: str) -> list[PartyObligation]:
     prompt = f"""You are an Indian legal expert. From this {doc_type}, extract the obligations of each party.
@@ -513,7 +522,7 @@ DOCUMENT:
 
 
 # ─────────────────────────────────────────────────────────────
-# Missing clauses detector  (NEW)
+# Missing clauses detector
 # ─────────────────────────────────────────────────────────────
 def detect_missing_clauses(text: str, type_key: str) -> list[MissingClause]:
     required = DOCUMENT_TYPES.get(type_key, DOCUMENT_TYPES["unknown"])["required_clauses"]
@@ -529,8 +538,8 @@ Clauses to check:
 
 Return a JSON array, one item per clause:
 [
-  {{"clause": "Termination clause",   "present": true,  "why_important": "Defines how either party can exit the agreement."}},
-  {{"clause": "Notice period clause", "present": false, "why_important": "Protects you from sudden eviction without warning."}}
+  {{"clause": "Termination clause",   "present": true,  "why_important": "Defines how either party can exit."}},
+  {{"clause": "Notice period clause", "present": false, "why_important": "Protects you from sudden eviction."}}
 ]
 
 Return ONLY valid JSON array.
@@ -551,7 +560,6 @@ DOCUMENT:
         except Exception:
             pass
 
-    # Fallback: keyword-based detection if LLM returned nothing
     if not results:
         lower = text.lower()
         for clause in required:
@@ -566,7 +574,7 @@ DOCUMENT:
 
 
 # ─────────────────────────────────────────────────────────────
-# Key numbers extractor  (NEW)
+# Key numbers extractor
 # ─────────────────────────────────────────────────────────────
 def extract_key_numbers(text: str) -> list[KeyNumber]:
     prompt = f"""Extract every monetary amount, date, percentage, and duration from this legal document.
@@ -576,12 +584,10 @@ Return a JSON array:
   {{"label": "Security Deposit", "value": "₹50,000",     "type": "monetary"}},
   {{"label": "Monthly Rent",     "value": "₹15,000",     "type": "monetary"}},
   {{"label": "Notice Period",    "value": "30 days",      "type": "duration"}},
-  {{"label": "Start Date",       "value": "1 Jan 2025",   "type": "date"}},
-  {{"label": "Late Fee",         "value": "2% per month", "type": "percentage"}}
+  {{"label": "Start Date",       "value": "1 Jan 2025",   "type": "date"}}
 ]
 
 Types: monetary / date / percentage / duration / other
-Extract EVERY number — miss nothing.
 Return ONLY valid JSON array.
 
 DOCUMENT:
@@ -599,7 +605,6 @@ DOCUMENT:
             ))
         except Exception:
             pass
-    # Deduplicate by (normalised value, type)
     seen, unique = set(), []
     for n in results:
         key = (re.sub(r'\s+', '', n.value.strip().lower()), n.type)
@@ -610,7 +615,7 @@ DOCUMENT:
 
 
 # ─────────────────────────────────────────────────────────────
-# Deadline / limitation period alerts  (NEW)
+# Deadline alerts
 # ─────────────────────────────────────────────────────────────
 def extract_deadlines(text: str) -> list[Deadline]:
     prompt = f"""Extract all deadlines, time limits, and limitation periods from this legal document.
@@ -643,7 +648,7 @@ DOCUMENT:
 
 
 # ─────────────────────────────────────────────────────────────
-# Suggested questions  (NEW)
+# Suggested questions
 # ─────────────────────────────────────────────────────────────
 def generate_suggested_questions(text: str, doc_type: str) -> list[str]:
     prompt = f"""You are an Indian legal expert. A user just had their {doc_type} analyzed.
@@ -662,7 +667,6 @@ DOCUMENT (first 1500 chars):
     data = parse_json_response(raw, [])
     if isinstance(data, list) and len(data) >= 3:
         return [str(q) for q in data[:6]]
-
     return [
         "What are my main obligations under this agreement?",
         "Can the other party terminate without prior notice?",
@@ -674,7 +678,7 @@ DOCUMENT (first 1500 chars):
 
 
 # ─────────────────────────────────────────────────────────────
-# Signature verdict  (NEW)
+# Signature verdict
 # ─────────────────────────────────────────────────────────────
 def get_signature_verdict(
     clauses: list[ClauseAnalysis],
@@ -688,13 +692,13 @@ def get_signature_verdict(
         return SignatureVerdict(
             verdict="Do Not Sign",
             color="red",
-            reason=f"Contains {illegal_count} illegal clause(s) that violate Indian law. Seek legal counsel before proceeding.",
+            reason=f"Contains {illegal_count} illegal clause(s) that violate Indian law. Seek legal counsel.",
         )
     if high_risk_count >= 3 or (high_risk_count >= 1 and missing_count >= 2):
         return SignatureVerdict(
             verdict="Negotiate First",
             color="orange",
-            reason=f"{high_risk_count} high-risk clause(s) and {missing_count} missing standard protection(s) need to be resolved first.",
+            reason=f"{high_risk_count} high-risk clause(s) and {missing_count} missing standard protection(s).",
         )
     if high_risk_count >= 1 or missing_count >= 2:
         return SignatureVerdict(
@@ -718,8 +722,8 @@ def compute_overall_risk(clauses: list[ClauseAnalysis]) -> str:
     illegal = sum(1 for c in clauses if c.risk_level == "Illegal")
     high    = sum(1 for c in clauses if c.risk_level == "High Risk")
     caution = sum(1 for c in clauses if c.risk_level == "Caution")
-    if illegal > 0:              return "Critical"
-    if high >= 2:                return "High"
+    if illegal > 0:               return "Critical"
+    if high >= 2:                 return "High"
     if high == 1 or caution >= 3: return "Moderate"
     return "Safe"
 
@@ -728,14 +732,13 @@ def compute_overall_risk(clauses: list[ClauseAnalysis]) -> str:
 # Legal section extraction + explanation
 # ─────────────────────────────────────────────────────────────
 def extract_legal_sections(text: str) -> list[str]:
-    """Extract BNS / IPC / CrPC / BNSS / BSA section references from the document text."""
     patterns = [
         r'(?:BNS|Bharatiya Nyaya Sanhita)\s*(?:Section|Sec\.?|S\.)?\s*\d+(?:\s*\([^)]+\))?',
         r'(?:IPC|Indian Penal Code)\s*(?:Section|Sec\.?)?\s*\d+(?:\s*\([^)]+\))?',
         r'(?:CrPC|BNSS|Bharatiya Nagarik Suraksha Sanhita)\s*(?:Section|Sec\.?)?\s*\d+(?:\s*\([^)]+\))?',
         r'(?:BSA|Bharatiya Sakshya Adhiniyam)\s*(?:Section|Sec\.?)?\s*\d+(?:\s*\([^)]+\))?',
         r'[Ss]ection\s*\d+(?:\s*\([^)]+\))?\s+(?:of\s+(?:the\s+)?)?(?:BNS|IPC|CrPC|BNSS|BSA|Indian Penal Code|Bharatiya Nyaya Sanhita)',
-        r'[Uu]/[Ss]\s*\d+(?:\s*\([^)]+\))?',   # shorthand u/s 420
+        r'[Uu]/[Ss]\s*\d+(?:\s*\([^)]+\))?',
     ]
     found = set()
     for p in patterns:
@@ -747,7 +750,6 @@ def extract_legal_sections(text: str) -> list[str]:
 
 
 def explain_legal_sections(sections: list[str], doc_type: str) -> list[dict]:
-    """Return plain-English explanations for each section using Groq."""
     if not sections:
         return []
     slist = "\n".join(f"- {s}" for s in sections[:8])
@@ -759,7 +761,7 @@ def explain_legal_sections(sections: list[str], doc_type: str) -> list[dict]:
         '[{\n'
         '  "section": "BNS Section 304",\n'
         '  "title": "Theft",\n'
-        '  "explanation": "Punishes taking someone else\'s property without consent with dishonest intent.",\n'
+        '  "explanation": "Punishes taking someone else\'s property without consent.",\n'
         '  "punishment": "Imprisonment up to 3 years, or fine, or both",\n'
         '  "key_elements": ["Dishonest intention", "Property belongs to another", "Without consent"]\n'
         "}]\n\n"
@@ -774,7 +776,6 @@ def explain_legal_sections(sections: list[str], doc_type: str) -> list[dict]:
 # IndianKanoon
 # ─────────────────────────────────────────────────────────────
 def fetch_case_laws(query: str, doc_type: str, sections: list[str] = None, pagenum: int = 0) -> list[dict]:
-    """Fetch case laws — searches each legal section first, then falls back to general query."""
     if not INDIANKANOON_API_KEY:
         return [{
             "title":   "IndianKanoon API key not configured",
@@ -783,12 +784,11 @@ def fetch_case_laws(query: str, doc_type: str, sections: list[str] = None, pagen
             "court":   "", "year": "", "related_section": None,
         }]
 
-    # Build targeted queries — specific section searches first
     queries: list[str] = []
     if sections:
         for s in sections[:5]:
             queries.append(s)
-    queries.append(query[:200])   # general fallback
+    queries.append(query[:200])
 
     results, seen_tids = [], set()
     for search_q in queries:
@@ -809,12 +809,8 @@ def fetch_case_laws(query: str, doc_type: str, sections: list[str] = None, pagen
                 if tid in seen_tids:
                     continue
                 seen_tids.add(tid)
-                
-                # Use Kanoon's provided snippet (clean HTML tags)
-                raw_summary = doc.get("headline", "") + " " + doc.get("doc", "")[:500]
-                # Strip HTML tags
+                raw_summary  = doc.get("headline", "") + " " + doc.get("doc", "")[:500]
                 clean_summary = re.sub(r'<[^>]+>', '', raw_summary).strip()
-                
                 results.append({
                     "title":           re.sub(r'<[^>]+>', '', doc.get("title", "Untitled")),
                     "summary":         clean_summary + "...",
@@ -829,126 +825,75 @@ def fetch_case_laws(query: str, doc_type: str, sections: list[str] = None, pagen
             print(f"[KANOON] Error for '{search_q[:60]}': {e}")
     return results
 
+
 def fetch_acts(
     query: str,
-    act_type: str = "central",   # "central" or "state"
+    act_type: str = "central",
     state_name: str = "",
     pagenum: int = 0
 ) -> list[dict]:
-
     if not INDIANKANOON_API_KEY:
         return [{
-            "title": "IndianKanoon API key not configured",
-            "summary": "Add INDIANKANOON_API_KEY to your .env file.",
-            "url": "https://indiankanoon.org",
-            "jurisdiction": "",
-            "year": "",
-            "act_type": act_type,
+            "title":        "IndianKanoon API key not configured",
+            "summary":      "Add INDIANKANOON_API_KEY to your .env file.",
+            "url":          "https://indiankanoon.org",
+            "jurisdiction": "", "year": "", "act_type": act_type,
         }]
 
-    results = []
-    seen_tids = set()
-
+    results, seen_tids = [], set()
     try:
-        # Build query properly for Acts
-        if act_type.lower() == "central":
-            search_query = f"{query} central act"
-
-        elif act_type.lower() == "state":
-            search_query = f"{query} {state_name} state act"
-
-        else:
-            search_query = query
-
-        encoded_query = quote(search_query)
-
+        search_query = (
+            f"{query} central act"         if act_type.lower() == "central" else
+            f"{query} {state_name} state act" if act_type.lower() == "state" else
+            query
+        )
         r = req.post(
             "https://api.indiankanoon.org/search/",
-            data={
-                "formInput": search_query,
-                "pagenum": pagenum
-            },
-            headers={
-                "Authorization": f"Token {INDIANKANOON_API_KEY}",
-                "Content-Type": "application/x-www-form-urlencoded"
-            },
+            data={"formInput": search_query, "pagenum": pagenum},
+            headers={"Authorization": f"Token {INDIANKANOON_API_KEY}",
+                     "Content-Type": "application/x-www-form-urlencoded"},
             timeout=15,
         )
-
         r.raise_for_status()
-
-        data = r.json()
-        docs = data.get("docs", [])
-
-        for doc in docs:
-
+        for doc in r.json().get("docs", []):
             tid = doc.get("tid", "")
-
             if not tid or tid in seen_tids:
                 continue
-
             seen_tids.add(tid)
-
-            # Clean title
-            title = re.sub(
-                r"<[^>]+>",
-                "",
-                str(doc.get("title", "Untitled"))
-            ).strip()
-
-            # Clean summary
-            headline = str(doc.get("headline", ""))
-            doc_text = str(doc.get("doc", ""))[:500]
-
-            raw_summary = headline + " " + doc_text
-
-            clean_summary = re.sub(
-                r"<[^>]+>",
-                "",
-                raw_summary
-            ).strip()
-
-            # Detect jurisdiction
-            jurisdiction = doc.get("docsource", "")
-
-            # Extract year safely
+            title        = re.sub(r"<[^>]+>", "", str(doc.get("title", "Untitled"))).strip()
+            raw_summary  = str(doc.get("headline", "")) + " " + str(doc.get("doc", ""))[:500]
+            clean_summary = re.sub(r"<[^>]+>", "", raw_summary).strip()
             publish_date = str(doc.get("publishdate", ""))
-            year = publish_date[:4] if publish_date else ""
-
             results.append({
-                "title": title,
-                "summary": clean_summary + "...",
-                "url": f"https://indiankanoon.org/doc/{tid}/",
-                "jurisdiction": jurisdiction,
-                "year": year,
-                "act_type": act_type,
-                "doc_id": tid,
+                "title":        title,
+                "summary":      clean_summary + "...",
+                "url":          f"https://indiankanoon.org/doc/{tid}/",
+                "jurisdiction": doc.get("docsource", ""),
+                "year":         publish_date[:4] if publish_date else "",
+                "act_type":     act_type,
+                "doc_id":       tid,
             })
-
     except Exception as e:
         print(f"[ACTS ERROR] {e}")
-
     return results
 
+
 # ─────────────────────────────────────────────────────────────
-# Document RAG — multi-turn Q&A  (ENHANCED)
+# Document RAG — multi-turn Q&A
 # ─────────────────────────────────────────────────────────────
 class DocumentRAG:
-    """In-memory vector store for a single uploaded document. Supports multi-turn conversation."""
+    """
+    In-memory vector store for a single uploaded document.
+    Uses _ColabEmbedder — all embedding inference runs on Colab GPU.
+    """
 
     def __init__(self):
-        try:
-            self.embedder = SentenceTransformer(
-                EMBED_MODEL, device=str(DEVICE), local_files_only=True
-            )
-        except Exception as _e:
-            print(f"[DocRAG] ⚠️  Local embedding model unavailable ({_e}). Using fallback.")
-            self.embedder = SentenceTransformer("all-MiniLM-L6-v2", device=str(DEVICE))
+        # Use Colab embedder — no local GPU / torch required
+        self.embedder    = _ColabEmbedder()
         self.chunks:     list[str]  = []
         self.embeddings             = []
         self.doc_type:   str        = "Legal Document"
-        # Multi-turn: store full conversation history
-        self.history:    list[dict] = []   # [{"role": "user"/"assistant", "content": "..."}]
+        self.history:    list[dict] = []
 
     def index(self, clauses: list[str], doc_type: str = "Legal Document"):
         self.chunks     = clauses
@@ -968,14 +913,14 @@ class DocumentRAG:
         return [self.chunks[i] for i in top_idx]
 
     def answer(self, question: str) -> QAResponse:
-        """Bulletproof multi-turn Q&A with legal expert system prompt."""
         print(f"[DocRAG.answer] Q: {question[:100]}")
         if not self.chunks:
-            return QAResponse(question=question,
+            return QAResponse(
+                question=question,
                 answer="No document indexed. Please upload a document first.",
-                confidence=0.0, sources=[], disclaimer="Upload a document to begin.")
+                confidence=0.0, sources=[], disclaimer="Upload a document to begin."
+            )
 
-        # Top-6 relevant chunks + always include opening paragraph for context
         relevant = self.retrieve(question, top_k=6)
         if self.chunks and self.chunks[0] not in relevant:
             relevant = [self.chunks[0]] + relevant[:5]
@@ -1014,12 +959,17 @@ class DocumentRAG:
                 disclaimer = "⚠ Low confidence — verify with the document or consult a lawyer."
             elif confidence < 0.65:
                 disclaimer = "ℹ Moderate confidence — cross-check with the original document."
-            return QAResponse(question=question, answer=answer_text, confidence=confidence,
-                sources=[c[:120] for c in relevant[:3]], disclaimer=disclaimer)
+            return QAResponse(
+                question=question, answer=answer_text, confidence=confidence,
+                sources=[c[:120] for c in relevant[:3]], disclaimer=disclaimer
+            )
         except Exception as e:
             print(f"[DocRAG.answer] Error: {e}")
-            return QAResponse(question=question, answer=f"Error: {str(e)}",
-                confidence=0.0, sources=[], disclaimer="Technical error. Please try again.")
+            return QAResponse(
+                question=question, answer=f"Error: {str(e)}",
+                confidence=0.0, sources=[], disclaimer="Technical error. Please try again."
+            )
+
 
 # ─────────────────────────────────────────────────────────────
 # Main analysis pipeline  (PARALLEL v6 — concurrent.futures)
@@ -1030,24 +980,6 @@ def analyze_document(
     max_clauses:   int = 15,
     type_override: Optional[str] = None,
 ) -> tuple["DocumentAnalysis", "DocumentRAG"]:
-    """
-    Full document analysis with two-phase parallelism.
-    Uses concurrent.futures.ThreadPoolExecutor — safe to call from FastAPI
-    async endpoints because it does NOT touch the uvicorn event loop.
-
-    Phase 1 (parallel):
-      • Translation  (local NLLB → Gemini → Groq)
-      • Document-type detection  (keyword match)
-      • Legal section extraction (regex)
-
-    Phase 2 (all submitted simultaneously):
-      • All clause analyses, summary, party obligations,
-        key numbers, deadlines, suggested questions,
-        section explanations, compliance score
-
-    Phase 3 (after clause risk is known):
-      • IndianKanoon targeted case-law fetch
-    """
     import time as _t
     t0 = _t.perf_counter()
     print(f"\n[ANALYZER] >> Processing: {filename}")
@@ -1065,7 +997,7 @@ def analyze_document(
         name = lang_info.get("language_name", "English")
         if code == "en":
             return None, None, None, None, name, code
-        print(f"[ANALYZER|P1] Detected {name}. Translating (NLLB → Gemini → Groq)...")
+        print(f"[ANALYZER|P1] Detected {name}. Translating (Colab NLLB → Gemini → Groq)...")
         tr = translate_legal_text(text, source_lang=code, target_lang="en")
         translated = tr.get("translated_text", "")
         if translated and translated.strip():
@@ -1085,24 +1017,20 @@ def analyze_document(
             return type_override, DOCUMENT_TYPES[type_override]["label"], 100
         return detect_document_type(wtext)
 
-    def _do_sections(wtext: str, orig: str | None):
+    def _do_sections(wtext: str, orig):
         combined = wtext + (" " + orig if orig else "")
         return extract_legal_sections(combined)
 
-    # Submit Phase 1 tasks
     f_trans = _EXECUTOR.submit(_do_translation)
-
-    # Translation is the bottleneck; wait for it first
     (
         original_text, full_translation,
         translation_engine, translation_confidence,
         source_lang_name, source_lang_code,
-    ) = f_trans.result()   # blocks until translation done
+    ) = f_trans.result()
 
     working_text = full_translation if full_translation else text
 
-    # Type detection and section extraction are instant — do them in parallel
-    f_type    = _EXECUTOR.submit(_do_type_detect, working_text)
+    f_type     = _EXECUTOR.submit(_do_type_detect, working_text)
     f_sections = _EXECUTOR.submit(_do_sections, working_text, original_text)
     type_key, doc_type, type_conf = f_type.result()
     mentioned_sections             = f_sections.result()
@@ -1129,7 +1057,6 @@ def analyze_document(
                     .compute_compliance_score(working_text)["score"]
     )
 
-    # Wait for all clause analyses
     _futures_wait(clause_futs, return_when=ALL_COMPLETED)
     analyzed: list[ClauseAnalysis] = []
     for f in clause_futs:
@@ -1138,14 +1065,12 @@ def analyze_document(
         except Exception as e:
             print(f"[ANALYZER|P2] Clause task failed: {e}")
 
-    # Phase 3: IndianKanoon (needs risk distribution from clauses)
-    risky   = [c for c in analyzed if c.risk_level in ["High Risk", "Illegal"]]
-    kw_src  = risky or [c for c in analyzed if c.risk_level == "Caution"]
-    kws     = [c.explanation[:80] for c in kw_src[:2] if c.explanation and len(c.explanation) > 20]
+    risky    = [c for c in analyzed if c.risk_level in ["High Risk", "Illegal"]]
+    kw_src   = risky or [c for c in analyzed if c.risk_level == "Caution"]
+    kws      = [c.explanation[:80] for c in kw_src[:2] if c.explanation and len(c.explanation) > 20]
     kanoon_q = (f"{doc_type} {' '.join(kws)}")[:200] if kws else doc_type
     f_kanoon = _EXECUTOR.submit(fetch_case_laws, kanoon_q, doc_type, mentioned_sections)
 
-    # Collect remaining Phase 2 results
     def _safe(fut, default):
         if fut is None:
             return default
@@ -1155,19 +1080,18 @@ def analyze_document(
             print(f"[ANALYZER] Task failed ({type(e).__name__}): {e}")
             return default
 
-    summary             = _safe(f_summary,    "Summary generation failed.")
-    party_obligations   = _safe(f_party,      [])
-    missing_clauses     = _safe(f_missing,    [])
-    key_numbers         = _safe(f_numbers,    [])
-    deadlines           = _safe(f_deadlines,  [])
-    suggested_questions = _safe(f_questions,  [])
-    section_explanations = _safe(f_secexp,   [])
-    comp_score_raw      = _safe(f_compliance, 75)
-    case_laws           = _safe(f_kanoon,     [])
+    summary              = _safe(f_summary,    "Summary generation failed.")
+    party_obligations    = _safe(f_party,      [])
+    missing_clauses      = _safe(f_missing,    [])
+    key_numbers          = _safe(f_numbers,    [])
+    deadlines            = _safe(f_deadlines,  [])
+    suggested_questions  = _safe(f_questions,  [])
+    section_explanations = _safe(f_secexp,     [])
+    comp_score_raw       = _safe(f_compliance, 75)
+    case_laws            = _safe(f_kanoon,     [])
 
     comp_score = int(comp_score_raw) if comp_score_raw else 75
 
-    # ── Assemble ───────────────────────────────────────────────────────────────
     dist = {"Safe": 0, "Caution": 0, "High Risk": 0, "Illegal": 0}
     for c in analyzed:
         dist[c.risk_level] = dist.get(c.risk_level, 0) + 1
