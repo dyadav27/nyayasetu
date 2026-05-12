@@ -169,9 +169,12 @@ def run_smoke_test():
     # Test 2: sentence-transformers on GPU
     try:
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device=str(DEVICE))
+        import os
+        _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        embed_model_path = os.path.join(_PROJECT_ROOT, "hf_models", "embedding_model")
+        model = SentenceTransformer(embed_model_path, device=str(DEVICE))
         emb   = model.encode(["test legal query about BNS section 303"])
-        print(f"   MiniLM embedding shape: {emb.shape}  device:{DEVICE}  ✅")
+        print(f"   MuRIL embedding shape: {emb.shape}  device:{DEVICE}  ✅")
         del model
         torch.cuda.empty_cache()
     except Exception as e:

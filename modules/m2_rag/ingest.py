@@ -10,6 +10,10 @@ Run once: python m2_rag/ingest.py
 
 import os, sys, json, hashlib
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+# Add backend/ so local_models.py and gpu_utils.py are importable
+_BACKEND_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "backend")
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
 
 import fitz                        # PyMuPDF
 import chromadb
@@ -22,7 +26,9 @@ from gpu_utils import DEVICE, print_gpu_status, clear_gpu_cache
 PDF_DIR       = "data/statutes"
 CHROMA_DIR    = "data/chromadb"
 COLLECTION    = "nyayasetu_legal"
-EMBED_MODEL = r"C:\Users\Nitin Sharma\.cache\huggingface\hub\models--sentence-transformers--all-MiniLM-L6-v2\snapshots\8b3219a92973c328a8e22fadcfa821b5dc75636a"
+# Local MuRIL multilingual embedding model (handles Hindi/Marathi natively)
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+EMBED_MODEL   = os.path.join(_PROJECT_ROOT, "hf_models", "embedding_model")
 CHUNK_SIZE    = 512
 CHUNK_OVERLAP = 50
 
@@ -77,7 +83,11 @@ def chunk_pages(pages, filename):
 def ingest_all():
     # ── Load embedder on GPU ──────────────────────────────────────────────────
     print(f"\n[INGEST] Loading embedding model on {DEVICE}...")
-    embedder = SentenceTransformer(EMBED_MODEL, device=str(DEVICE))
+    try:
+        embedder = SentenceTransformer(EMBED_MODEL, device=str(DEVICE), local_files_only=True)
+    except Exception as _e:
+        print(f"[INGEST] ⚠️  Local model unavailable ({_e}). Falling back to all-MiniLM-L6-v2...")
+        embedder = SentenceTransformer("all-MiniLM-L6-v2", device=str(DEVICE))
     print_gpu_status("after embedder load")
 
     # ── ChromaDB ──────────────────────────────────────────────────────────────

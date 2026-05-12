@@ -25,6 +25,9 @@ from lex_validator import (
     extract_text_from_pdf_bytes,
     extract_text_from_image_bytes,
 )
+from database import SessionLocal
+import models
+from datetime import datetime, timedelta
 
 load_dotenv()
 
@@ -266,6 +269,66 @@ def serve_media(filename: str):
     if os.path.exists(path):
         return FileResponse(path)
     return JSONResponse({"error":"not found"}, status_code=404)
+
+@app.post("/admin/trigger_reminders")
+def trigger_reminders():
+    """Trigger daily WhatsApp reminders for lawyers (tasks and hearings)."""
+    db = SessionLocal()
+    try:
+        users = db.query(models.User).filter(models.User.phone != None).all()
+        tomorrow = datetime.utcnow() + timedelta(days=1)
+        today = datetime.utcnow()
+        
+        sent_count = 0
+        for u in users:
+            phone = u.phone.replace("+", "").replace("-", "").replace(" ", "")
+            if not phone: continue
+            
+            # Get pending tasks
+            tasks = db.query(models.Task).filter(
+                models.Task.assignee_id == u.id, 
+                models.Task.is_completed == False
+            ).all()
+            
+            # Get cases to find hearings
+            cases = db.query(models.Case).filter(models.Case.lawyer_id == u.id).all()
+            case_ids = [c.id for c in cases]
+            hearings = db.query(models.Hearing).filter(
+                models.Hearing.case_id.in_(case_ids)
+            ).all()
+            
+            # Filter upcoming
+            upcoming_h = [h for h in hearings if h.hearing_date.date() == tomorrow.date() or h.hearing_date.date() == today.date()]
+            
+            if not tasks and not upcoming_h:
+                continue
+                
+            msg = f"🌅 *Good Morning, {u.full_name}!*\nHere is your NyayaSetu daily docket:\n\n"
+            
+            if upcoming_h:
+                msg += "⚖️ *Upcoming Hearings:*\n"
+                for h in upcoming_h:
+                    c = next((c for c in cases if c.id == h.case_id), None)
+                    c_title = c.title if c else "Unknown Case"
+                    msg += f"• {c_title}: {h.purpose} ({h.hearing_date.strftime('%d %b')})\n"
+                msg += "\n"
+                
+            if tasks:
+                msg += "📋 *Pending Tasks:*\n"
+                for t in tasks:
+                    msg += f"• {t.title} (Due: {t.due_date.strftime('%d %b')})\n"
+                    
+            msg += "\nLog in to your Dashboard for more details."
+            
+            send_text(phone, msg)
+            sent_count += 1
+            
+        return {"status": "ok", "reminders_sent": sent_count}
+    except Exception as e:
+        print(f"[REMINDER ERROR] {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     import uvicorn

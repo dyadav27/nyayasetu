@@ -19,9 +19,18 @@ Handles:
   13. Limitation period / deadline alerts
   14. Suggested questions (6 per document)
   15. Signature verdict (Sign / Negotiate / Do Not Sign)
+
+PARALLEL PIPELINE (v6):
+  - Phase 1: Translation (local NLLB → Gemini → Groq) runs concurrently with
+             document-type detection & legal section extraction.
+  - Phase 2: ALL Groq analysis tasks (clause scoring, summary, party obligations,
+             key numbers, deadlines, suggested questions, case laws, section
+             explanations) fire simultaneously via asyncio + ThreadPoolExecutor.
+  - LLM backend: Groq API (GROQ_API_KEY from .env) — no Ollama required.
 """
 
 import os, sys, re, json
+from concurrent.futures import ThreadPoolExecutor, wait as _futures_wait, ALL_COMPLETED
 import requests as req
 from typing import Optional
 
@@ -35,13 +44,19 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from gpu_utils import DEVICE
 from legal_translator import detect_language_with_llm, translate_legal_text
+from urllib.parse import quote
 import base64
 
 load_dotenv()
 
+# Shared thread-pool for CPU-bound / blocking IO tasks (Groq calls, NLLB inference)
+_EXECUTOR = ThreadPoolExecutor(max_workers=12)
+
 GROQ_MODEL           = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 INDIANKANOON_API_KEY = os.getenv("INDIANKANOON_API_KEY", "")
-EMBED_MODEL = "all-MiniLM-L6-v2"   # resolved from HuggingFace cache automatically
+# Local MuRIL embedding model from hf_models/ (used for in-document RAG QA)
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+EMBED_MODEL   = os.path.join(_PROJECT_ROOT, "hf_models", "embedding_model")
 
 # ── Groq client ────────────────────────────────────────────────────────────────
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -443,9 +458,20 @@ Risk guide:
 
 
 # ─────────────────────────────────────────────────────────────
-# Document summary
+# Document summary  (BART local model primary, Groq fallback)
 # ─────────────────────────────────────────────────────────────
 def summarize_document(text: str, doc_type: str) -> str:
+    # ── 1. Try local BART model first (fast, no API cost) ──────────────────────
+    try:
+        from local_models import summarize_with_bart
+        bart_summary = summarize_with_bart(text[:3000])
+        if bart_summary and len(bart_summary) > 40:
+            print("[ANALYZER] BART summary OK.")
+            return bart_summary
+    except Exception as bart_err:
+        print(f"[ANALYZER] BART summarization failed ({bart_err}), falling back to Groq...")
+
+    # ── 2. Groq LLM fallback ────────────────────────────────────────────────────
     prompt = f"""You are an Indian legal assistant. Summarize this {doc_type} in plain English for a common person.
 Under 120 words. Cover: what it is, who the parties are, key obligations, and any major risks.
 No headings or bullet points.
@@ -747,7 +773,7 @@ def explain_legal_sections(sections: list[str], doc_type: str) -> list[dict]:
 # ─────────────────────────────────────────────────────────────
 # IndianKanoon
 # ─────────────────────────────────────────────────────────────
-def fetch_case_laws(query: str, doc_type: str, sections: list[str] = None) -> list[dict]:
+def fetch_case_laws(query: str, doc_type: str, sections: list[str] = None, pagenum: int = 0) -> list[dict]:
     """Fetch case laws — searches each legal section first, then falls back to general query."""
     if not INDIANKANOON_API_KEY:
         return [{
@@ -766,41 +792,143 @@ def fetch_case_laws(query: str, doc_type: str, sections: list[str] = None) -> li
 
     results, seen_tids = [], set()
     for search_q in queries:
-        if len(results) >= 6:
+        if len(results) >= 25:
             break
         try:
             r = req.post(
                 "https://api.indiankanoon.org/search/",
-                data={"formInput": search_q, "pagenum": 0},
+                data={"formInput": search_q, "pagenum": pagenum},
                 headers={"Authorization": f"Token {INDIANKANOON_API_KEY}",
                          "Content-Type": "application/x-www-form-urlencoded"},
                 timeout=15,
             )
             r.raise_for_status()
-            for doc in r.json().get("docs", [])[:3]:
+            docs = r.json().get("docs", [])
+            for doc in docs:
                 tid = doc.get("tid", "")
                 if tid in seen_tids:
                     continue
                 seen_tids.add(tid)
-                summary = call_llm(
-                    f"Summarize this Indian court judgment in 2-3 plain English sentences "
-                    f"relevant to '{search_q}':\n{doc.get('headline','')} {doc.get('doc','')[:500]}\n"
-                    "Write only the summary.",
-                    temperature=0.1,
-                )
+                
+                # Use Kanoon's provided snippet (clean HTML tags)
+                raw_summary = doc.get("headline", "") + " " + doc.get("doc", "")[:500]
+                # Strip HTML tags
+                clean_summary = re.sub(r'<[^>]+>', '', raw_summary).strip()
+                
                 results.append({
-                    "title":           doc.get("title", "Untitled"),
-                    "summary":         summary,
+                    "title":           re.sub(r'<[^>]+>', '', doc.get("title", "Untitled")),
+                    "summary":         clean_summary + "...",
                     "url":             f"https://indiankanoon.org/doc/{tid}",
                     "court":           doc.get("docsource", ""),
                     "year":            doc.get("publishdate", "")[:4] if doc.get("publishdate") else "",
                     "related_section": search_q if (sections and search_q in sections) else None,
                 })
+                if len(results) >= 25:
+                    break
         except Exception as e:
             print(f"[KANOON] Error for '{search_q[:60]}': {e}")
     return results
 
+def fetch_acts(
+    query: str,
+    act_type: str = "central",   # "central" or "state"
+    state_name: str = "",
+    pagenum: int = 0
+) -> list[dict]:
 
+    if not INDIANKANOON_API_KEY:
+        return [{
+            "title": "IndianKanoon API key not configured",
+            "summary": "Add INDIANKANOON_API_KEY to your .env file.",
+            "url": "https://indiankanoon.org",
+            "jurisdiction": "",
+            "year": "",
+            "act_type": act_type,
+        }]
+
+    results = []
+    seen_tids = set()
+
+    try:
+        # Build query properly for Acts
+        if act_type.lower() == "central":
+            search_query = f"{query} central act"
+
+        elif act_type.lower() == "state":
+            search_query = f"{query} {state_name} state act"
+
+        else:
+            search_query = query
+
+        encoded_query = quote(search_query)
+
+        r = req.post(
+            "https://api.indiankanoon.org/search/",
+            data={
+                "formInput": search_query,
+                "pagenum": pagenum
+            },
+            headers={
+                "Authorization": f"Token {INDIANKANOON_API_KEY}",
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            timeout=15,
+        )
+
+        r.raise_for_status()
+
+        data = r.json()
+        docs = data.get("docs", [])
+
+        for doc in docs:
+
+            tid = doc.get("tid", "")
+
+            if not tid or tid in seen_tids:
+                continue
+
+            seen_tids.add(tid)
+
+            # Clean title
+            title = re.sub(
+                r"<[^>]+>",
+                "",
+                str(doc.get("title", "Untitled"))
+            ).strip()
+
+            # Clean summary
+            headline = str(doc.get("headline", ""))
+            doc_text = str(doc.get("doc", ""))[:500]
+
+            raw_summary = headline + " " + doc_text
+
+            clean_summary = re.sub(
+                r"<[^>]+>",
+                "",
+                raw_summary
+            ).strip()
+
+            # Detect jurisdiction
+            jurisdiction = doc.get("docsource", "")
+
+            # Extract year safely
+            publish_date = str(doc.get("publishdate", ""))
+            year = publish_date[:4] if publish_date else ""
+
+            results.append({
+                "title": title,
+                "summary": clean_summary + "...",
+                "url": f"https://indiankanoon.org/doc/{tid}/",
+                "jurisdiction": jurisdiction,
+                "year": year,
+                "act_type": act_type,
+                "doc_id": tid,
+            })
+
+    except Exception as e:
+        print(f"[ACTS ERROR] {e}")
+
+    return results
 
 # ─────────────────────────────────────────────────────────────
 # Document RAG — multi-turn Q&A  (ENHANCED)
@@ -809,7 +937,13 @@ class DocumentRAG:
     """In-memory vector store for a single uploaded document. Supports multi-turn conversation."""
 
     def __init__(self):
-        self.embedder   = SentenceTransformer(EMBED_MODEL, device=str(DEVICE))
+        try:
+            self.embedder = SentenceTransformer(
+                EMBED_MODEL, device=str(DEVICE), local_files_only=True
+            )
+        except Exception as _e:
+            print(f"[DocRAG] ⚠️  Local embedding model unavailable ({_e}). Using fallback.")
+            self.embedder = SentenceTransformer("all-MiniLM-L6-v2", device=str(DEVICE))
         self.chunks:     list[str]  = []
         self.embeddings             = []
         self.doc_type:   str        = "Legal Document"
@@ -888,100 +1022,157 @@ class DocumentRAG:
                 confidence=0.0, sources=[], disclaimer="Technical error. Please try again.")
 
 # ─────────────────────────────────────────────────────────────
-# Main analysis pipeline
+# Main analysis pipeline  (PARALLEL v6 — concurrent.futures)
 # ─────────────────────────────────────────────────────────────
 def analyze_document(
     file_bytes:    bytes,
     filename:      str,
     max_clauses:   int = 15,
     type_override: Optional[str] = None,
-) -> tuple[DocumentAnalysis, DocumentRAG]:
+) -> tuple["DocumentAnalysis", "DocumentRAG"]:
+    """
+    Full document analysis with two-phase parallelism.
+    Uses concurrent.futures.ThreadPoolExecutor — safe to call from FastAPI
+    async endpoints because it does NOT touch the uvicorn event loop.
 
-    print(f"\n[ANALYZER] Processing: {filename}")
+    Phase 1 (parallel):
+      • Translation  (local NLLB → Gemini → Groq)
+      • Document-type detection  (keyword match)
+      • Legal section extraction (regex)
 
-    # 1. Extract text
+    Phase 2 (all submitted simultaneously):
+      • All clause analyses, summary, party obligations,
+        key numbers, deadlines, suggested questions,
+        section explanations, compliance score
+
+    Phase 3 (after clause risk is known):
+      • IndianKanoon targeted case-law fetch
+    """
+    import time as _t
+    t0 = _t.perf_counter()
+    print(f"\n[ANALYZER] >> Processing: {filename}")
+
+    # ── Step 0: Extract text ─────────────────────────────────────────────────
     text = extract_text(file_bytes, filename)
     if not text:
         raise ValueError("Could not extract text from document.")
     print(f"[ANALYZER] Extracted {len(text)} chars")
 
-    # 1.5. Auto-translate if regional language
-    lang_info        = detect_language_with_llm(text)
-    source_lang_code = lang_info.get("language_code", "en")
-    source_lang_name = lang_info.get("language_name", "English")
+    # ── Phase 1: Translation + type detect + section extract — PARALLEL ────────
+    def _do_translation():
+        lang_info = detect_language_with_llm(text)
+        code = lang_info.get("language_code", "en")
+        name = lang_info.get("language_name", "English")
+        if code == "en":
+            return None, None, None, None, name, code
+        print(f"[ANALYZER|P1] Detected {name}. Translating (NLLB → Gemini → Groq)...")
+        tr = translate_legal_text(text, source_lang=code, target_lang="en")
+        translated = tr.get("translated_text", "")
+        if translated and translated.strip():
+            return (
+                text,
+                translated,
+                tr.get("engine", "unknown"),
+                tr.get("confidence"),
+                name,
+                code,
+            )
+        print("[ANALYZER|P1] Translation returned empty — using original text.")
+        return None, None, None, None, name, code
 
-    original_text          = None
-    full_translation       = None
-    translation_engine     = None
-    translation_confidence = None
+    def _do_type_detect(wtext: str):
+        if type_override and type_override in DOCUMENT_TYPES:
+            return type_override, DOCUMENT_TYPES[type_override]["label"], 100
+        return detect_document_type(wtext)
 
-    if source_lang_code != "en":
-        print(f"[ANALYZER] Detected {source_lang_name}. Translating via Google Gemini...")
-        tr = translate_legal_text(text, source_lang=source_lang_code, target_lang="en")
-        if tr.get("translated_text"):
-            original_text          = text
-            full_translation       = tr["translated_text"]
-            text                   = full_translation
-            translation_engine     = tr.get("engine", "unknown")
-            translation_confidence = tr.get("confidence")
-            print(f"[ANALYZER] Translation done ({translation_engine}).")
-        else:
-            print("[ANALYZER] Translation failed. Using original.")
-            source_lang_name = "English (Fallback)"
+    def _do_sections(wtext: str, orig: str | None):
+        combined = wtext + (" " + orig if orig else "")
+        return extract_legal_sections(combined)
 
-    # 1.6. Extract legal section references (BNS, IPC, CrPC …)
-    combined_text      = text + (" " + original_text if original_text else "")
-    mentioned_sections = extract_legal_sections(combined_text)
-    print(f"[ANALYZER] Sections found: {mentioned_sections}")
+    # Submit Phase 1 tasks
+    f_trans = _EXECUTOR.submit(_do_translation)
 
-    # 2. Document type
-    if type_override and type_override in DOCUMENT_TYPES:
-        type_key, doc_type, type_conf = type_override, DOCUMENT_TYPES[type_override]["label"], 100
-    else:
-        type_key, doc_type, type_conf = detect_document_type(text)
-    print(f"[ANALYZER] Type: {doc_type} ({type_conf}%)")
+    # Translation is the bottleneck; wait for it first
+    (
+        original_text, full_translation,
+        translation_engine, translation_confidence,
+        source_lang_name, source_lang_code,
+    ) = f_trans.result()   # blocks until translation done
 
-    # 2.5. Plain-English explanations for every section found
-    section_explanations = []
-    if mentioned_sections:
-        print(f"[ANALYZER] Explaining {len(mentioned_sections)} sections...")
-        section_explanations = explain_legal_sections(mentioned_sections, doc_type)
+    working_text = full_translation if full_translation else text
 
-    # 3. Segment + analyse clauses
-    all_clauses = segment_clauses(text)
+    # Type detection and section extraction are instant — do them in parallel
+    f_type    = _EXECUTOR.submit(_do_type_detect, working_text)
+    f_sections = _EXECUTOR.submit(_do_sections, working_text, original_text)
+    type_key, doc_type, type_conf = f_type.result()
+    mentioned_sections             = f_sections.result()
+    print(f"[ANALYZER|P1] ✔ Type: {doc_type} ({type_conf}%) | Sections: {mentioned_sections}")
+
+    # ── Phase 2: All analysis tasks submitted simultaneously ──────────────────
+    all_clauses = segment_clauses(working_text)
     clauses     = all_clauses[:max_clauses]
-    print(f"[ANALYZER] {len(all_clauses)} clauses, analysing {len(clauses)}")
+    print(f"[ANALYZER|P2] Submitting {len(clauses)} clause tasks + 6 doc-level tasks...")
 
+    clause_futs  = [_EXECUTOR.submit(analyze_clause, c, doc_type) for c in clauses]
+    f_summary    = _EXECUTOR.submit(summarize_document, working_text, doc_type)
+    f_party      = _EXECUTOR.submit(extract_party_obligations, working_text, doc_type)
+    f_missing    = _EXECUTOR.submit(detect_missing_clauses, working_text, type_key)
+    f_numbers    = _EXECUTOR.submit(extract_key_numbers, working_text)
+    f_deadlines  = _EXECUTOR.submit(extract_deadlines, working_text)
+    f_questions  = _EXECUTOR.submit(generate_suggested_questions, working_text, doc_type)
+    f_secexp     = (
+        _EXECUTOR.submit(explain_legal_sections, mentioned_sections, doc_type)
+        if mentioned_sections else None
+    )
+    f_compliance = _EXECUTOR.submit(
+        lambda: __import__("lex_validator", fromlist=["compute_compliance_score"])
+                    .compute_compliance_score(working_text)["score"]
+    )
+
+    # Wait for all clause analyses
+    _futures_wait(clause_futs, return_when=ALL_COMPLETED)
     analyzed: list[ClauseAnalysis] = []
-    for i, clause in enumerate(clauses):
-        print(f"[ANALYZER] Clause {i+1}/{len(clauses)}...")
-        analyzed.append(analyze_clause(clause, doc_type))
+    for f in clause_futs:
+        try:
+            analyzed.append(f.result())
+        except Exception as e:
+            print(f"[ANALYZER|P2] Clause task failed: {e}")
 
-    summary = summarize_document(text, doc_type)
-    dist    = {"Safe": 0, "Caution": 0, "High Risk": 0, "Illegal": 0}
+    # Phase 3: IndianKanoon (needs risk distribution from clauses)
+    risky   = [c for c in analyzed if c.risk_level in ["High Risk", "Illegal"]]
+    kw_src  = risky or [c for c in analyzed if c.risk_level == "Caution"]
+    kws     = [c.explanation[:80] for c in kw_src[:2] if c.explanation and len(c.explanation) > 20]
+    kanoon_q = (f"{doc_type} {' '.join(kws)}")[:200] if kws else doc_type
+    f_kanoon = _EXECUTOR.submit(fetch_case_laws, kanoon_q, doc_type, mentioned_sections)
+
+    # Collect remaining Phase 2 results
+    def _safe(fut, default):
+        if fut is None:
+            return default
+        try:
+            return fut.result()
+        except Exception as e:
+            print(f"[ANALYZER] Task failed ({type(e).__name__}): {e}")
+            return default
+
+    summary             = _safe(f_summary,    "Summary generation failed.")
+    party_obligations   = _safe(f_party,      [])
+    missing_clauses     = _safe(f_missing,    [])
+    key_numbers         = _safe(f_numbers,    [])
+    deadlines           = _safe(f_deadlines,  [])
+    suggested_questions = _safe(f_questions,  [])
+    section_explanations = _safe(f_secexp,   [])
+    comp_score_raw      = _safe(f_compliance, 75)
+    case_laws           = _safe(f_kanoon,     [])
+
+    comp_score = int(comp_score_raw) if comp_score_raw else 75
+
+    # ── Assemble ───────────────────────────────────────────────────────────────
+    dist = {"Safe": 0, "Caution": 0, "High Risk": 0, "Illegal": 0}
     for c in analyzed:
         dist[c.risk_level] = dist.get(c.risk_level, 0) + 1
-    overall = compute_overall_risk(analyzed)
-
-    try:
-        from lex_validator import compute_compliance_score
-        comp_score = compute_compliance_score(text)["score"]
-    except Exception:
-        comp_score = 75
-
-    # 9. Case laws — section-targeted search first
-    risky    = [c for c in analyzed if c.risk_level in ["High Risk", "Illegal"]]
-    kw_src   = risky or [c for c in analyzed if c.risk_level == "Caution"]
-    kws      = [c.explanation[:80] for c in kw_src[:2] if c.explanation and len(c.explanation) > 20]
-    kanoon_q = (f"{doc_type} {' '.join(kws)}")[:200] if kws else doc_type
-    case_laws = fetch_case_laws(kanoon_q, doc_type, sections=mentioned_sections)
-
-    party_obligations   = extract_party_obligations(text, doc_type)
-    missing_clauses     = detect_missing_clauses(text, type_key)
-    key_numbers         = extract_key_numbers(text)
-    deadlines           = extract_deadlines(text)
-    suggested_questions = generate_suggested_questions(text, doc_type)
-    signature_verdict   = get_signature_verdict(analyzed, missing_clauses)
+    overall           = compute_overall_risk(analyzed)
+    signature_verdict = get_signature_verdict(analyzed, missing_clauses)
 
     recommendations = []
     if dist["Illegal"] > 0:
@@ -998,7 +1189,10 @@ def analyze_document(
     doc_rag = DocumentRAG()
     doc_rag.index(all_clauses, doc_type)
 
-    result = DocumentAnalysis(
+    elapsed = _t.perf_counter() - t0
+    print(f"[ANALYZER] ✅ Done in {elapsed:.1f}s | Verdict: {signature_verdict.verdict}")
+
+    return DocumentAnalysis(
         document_name=filename,
         document_type=doc_type,
         document_type_key=type_key,
@@ -1024,6 +1218,4 @@ def analyze_document(
         translation_confidence=translation_confidence,
         mentioned_sections=mentioned_sections,
         section_explanations=section_explanations,
-    )
-    print(f"[ANALYZER] Done. Verdict: {signature_verdict.verdict}")
-    return result, doc_rag
+    ), doc_rag

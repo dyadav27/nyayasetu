@@ -6,16 +6,19 @@ RTX 4050 Laptop specs:
   - VRAM: 6 GB GDDR6
   - CUDA Compute: 8.9 (Ada Lovelace)
   - Tensor Cores: 4th gen
-  - Best for: inference with 4-bit / 8-bit quantised models
+  - Best for: inference with float16 / local transformer models
 
-VRAM budget breakdown:
-  - Llama-3 8B (4-bit via Ollama): ~4.5 GB  → handled by Ollama separately
-  - sentence-transformers MiniLM:  ~90 MB
-  - cross-encoder MiniLM:          ~90 MB
-  - SpeechT5 TTS + HiFiGAN:        ~350 MB
-  - ChromaDB (CPU):                 RAM only
-  Total GPU peak (without Llama-3): ~530 MB  ← well within 6 GB
-  Llama-3 runs in its own Ollama process: ~4.5 GB
+VRAM budget breakdown (local HuggingFace models only):
+  - NLLB-200 translation (float16):   ~2.5 GB (on-demand, lazy-loaded)
+  - BART summarization (float32):     ~1.6 GB (on-demand, lazy-loaded)
+  - MuRIL / embedding model:          ~90  MB (persistent)
+  - SpeechT5 TTS + HiFiGAN:          ~350 MB
+  - ChromaDB (CPU):                    RAM only
+  Total GPU peak (all models):  ~4.5 GB  ← within 6 GB budget
+
+LLM inference (Groq API):
+  - All LLM calls (Llama-3.1, Llama-3.3-70b) go via Groq cloud.
+  - No local Ollama server needed.
 """
 
 import os

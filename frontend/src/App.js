@@ -5,6 +5,14 @@ import Analyzer from "./pages/Analyzer";
 import Compliance from "./pages/Compliance";
 import Evidence from "./pages/Evidence";
 import CaseLaws from "./pages/CaseLaws";
+import Dashboard from "./pages/Dashboard";
+import Generators from "./pages/Generators";
+import Billing from "./pages/Billing";
+import Research from "./pages/Research";
+import Editor from "./pages/Editor";
+import Matters from "./pages/Matters";
+import Tasks from "./pages/Tasks";
+import Calendar from "./pages/Calendar";
 import Footer from "./components/Footer";
 
 // ── Theme ─────────────────────────────────────────────────────────────────────
@@ -23,10 +31,25 @@ const T = {
 
 const LINKS = [
   { id: "home", label: "Home", icon: "home" },
-  { id: "analyzer", label: "Analyzer", icon: "doc" },
-  { id: "compliance", label: "Compliance", icon: "shield" },
-  { id: "evidence", label: "Evidence", icon: "camera" },
-  { id: "caselaws", label: "Case Laws", icon: "search" },
+  { id: "dashboard", label: "Dashboard", icon: "grid" },
+  { id: "matters", label: "Matters", icon: "grid" },
+  { id: "tasks", label: "Tasks", icon: "check" },
+  { id: "calendar", label: "Calendar", icon: "doc" },
+  { id: "editor", label: "Editor", icon: "file" },
+  { id: "research", label: "Research", icon: "book" },
+  { 
+    id: "ai_tools", 
+    label: "AI Tools", 
+    icon: "search",
+    subLinks: [
+      { id: "analyzer", label: "Analyzer", icon: "search" },
+      { id: "generators", label: "Generators", icon: "doc" },
+      { id: "compliance", label: "Compliance", icon: "shield" },
+      { id: "evidence", label: "Evidence", icon: "camera" },
+      { id: "caselaws", label: "Case Laws", icon: "book" },
+      { id: "billing", label: "Billing", icon: "file" }
+    ]
+  },
 ];
 
 // ── Scales of Justice SVG ─────────────────────────────────────────────────────
@@ -164,6 +187,35 @@ const Nav = ({ page, go, theme, toggle, t }) => {
           border-radius: 2px 2px 0 0;
         }
 
+        .ns-link-wrapper { position: relative; display: inline-flex; height: 100%; align-items: center; }
+        .ns-dropdown {
+          position: absolute; top: 100%; left: 0;
+          background: ${isDark ? "rgba(18,24,38,0.98)" : "rgba(255,255,255,0.98)"};
+          border: 1px solid ${t.border};
+          border-radius: 12px; padding: 6px;
+          display: flex; flex-direction: column; gap: 2px;
+          box-shadow: 0 10px 32px rgba(0,0,0,0.2);
+          min-width: 160px;
+          opacity: 0; pointer-events: none; transform: translateY(-4px);
+          transition: all 0.2s cubic-bezier(0.34,1.56,0.64,1);
+          backdrop-filter: blur(16px);
+        }
+        .ns-link-wrapper:hover .ns-dropdown {
+          opacity: 1; pointer-events: auto; transform: translateY(0);
+        }
+        .ns-drop-btn {
+          display: flex; align-items: center; gap: 10px;
+          padding: 8px 12px; border-radius: 8px; border: none;
+          background: transparent; color: ${t.sub};
+          font-size: 13px; font-weight: 600; cursor: pointer;
+          text-align: left; width: 100%; font-family: 'DM Sans', sans-serif;
+          transition: background 0.15s, color 0.15s;
+        }
+        .ns-drop-btn:hover {
+          background: ${t.blue}18; color: ${t.text};
+        }
+
+
         /* ── Right controls ── */
         .ns-right { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 
@@ -254,7 +306,25 @@ const Nav = ({ page, go, theme, toggle, t }) => {
 
         {/* Desktop nav */}
         <div className="ns-links">
-          {LINKS.map(l => (
+          {LINKS.map(l => l.subLinks ? (
+            <div key={l.id} className="ns-link-wrapper">
+              <button
+                className={`ns-link${(page === l.id || l.subLinks.some(s => s.id === page)) ? " on" : ""}`}
+                style={{ cursor: "default" }}
+              >
+                <Ic d={ICONS[l.icon]} size={12} color={(page === l.id || l.subLinks.some(s => s.id === page)) ? t.blue : "inherit"} sw={2} />
+                {l.label}
+              </button>
+              <div className="ns-dropdown">
+                {l.subLinks.map(sub => (
+                  <button key={sub.id} className="ns-drop-btn" onClick={() => go(sub.id)}>
+                    <Ic d={ICONS[sub.icon]} size={14} />
+                    {sub.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
             <button
               key={l.id}
               className={`ns-link${page === l.id ? " on" : ""}`}
@@ -283,7 +353,22 @@ const Nav = ({ page, go, theme, toggle, t }) => {
       {/* Mobile drawer */}
       {open && (
         <div className="ns-drawer">
-          {LINKS.map(l => (
+          {LINKS.map(l => l.subLinks ? (
+            <React.Fragment key={l.id}>
+              <div className="ns-dlink" style={{ opacity: 0.5 }}>{l.label}</div>
+              {l.subLinks.map(sub => (
+                <button
+                  key={sub.id}
+                  className={`ns-dlink${page === sub.id ? " on" : ""}`}
+                  style={{ paddingLeft: 32 }}
+                  onClick={() => { go(sub.id); setOpen(false); }}
+                >
+                  <Ic d={ICONS[sub.icon]} size={16} color={page === sub.id ? t.blue : t.sub} sw={1.8} />
+                  {sub.label}
+                </button>
+              ))}
+            </React.Fragment>
+          ) : (
             <button
               key={l.id}
               className={`ns-dlink${page === l.id ? " on" : ""}`}
@@ -319,6 +404,14 @@ function App() {
 
   const pages = {
     home: <Home t={t} go={setPage} />,
+    dashboard: <Dashboard t={t} toast={showToast} />,
+    matters: <Matters t={t} toast={showToast} />,
+    tasks: <Tasks t={t} toast={showToast} />,
+    calendar: <Calendar t={t} toast={showToast} />,
+    research: <Research t={t} toast={showToast} />,
+    editor: <Editor t={t} toast={showToast} />,
+    generators: <Generators t={t} toast={showToast} />,
+    billing: <Billing t={t} toast={showToast} />,
     analyzer: <Analyzer t={t} toast={showToast} state={analyzerState} setState={setAnalyzerState} />,
     compliance: <Compliance t={t} toast={showToast} state={complianceState} setState={setComplianceState} />,
     evidence: <Evidence t={t} toast={showToast} state={evidenceState} setState={setEvidenceState} />,

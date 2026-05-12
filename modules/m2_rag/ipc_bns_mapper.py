@@ -54,9 +54,11 @@ class IPCBnsRAGMapper:
             os.makedirs(self.chroma_path, exist_ok=True)
             self.client = chromadb.PersistentClient(path=self.chroma_path)
             
-            # Use sentence transformer for embeddings
+            # Use local MuRIL model for embeddings
+            _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            embed_model_path = os.path.join(_PROJECT_ROOT, "hf_models", "embedding_model")
             self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name="all-MiniLM-L6-v2"
+                model_name=embed_model_path
             )
             
             # Get or create collection

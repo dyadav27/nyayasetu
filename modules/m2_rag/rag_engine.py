@@ -3,17 +3,20 @@ M2 — RAG Engine: Query + Generation  [GPU-ACCELERATED]
 Nyaya-Setu | Team IKS | SPIT CSE 2025-26
 
 GPU usage:
-  - Bi-encoder  (MiniLM)      → GPU  ~90 MB VRAM
-  - Cross-encoder (ms-marco)  → GPU  ~90 MB VRAM
-  - LLM                       → Groq Cloud API (no local GPU needed)
+  - Bi-encoder  (MuRIL multilingual) → GPU  ~300 MB VRAM
+  - Cross-encoder (ms-marco)         → GPU  ~90 MB VRAM
+  - LLM                              → Groq Cloud API (no local GPU needed)
 
-IMPORTANT: Set these two paths to your local model folders before running.
+Embedding model loaded from hf_models/embedding_model (MuRIL — handles Hindi/Marathi natively).
 """
 
 import os, sys, json, re
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+# Add backend/ to sys.path so local_models.py is importable
+_BACKEND_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "backend")
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
 
-from PIL.ImagePalette import raw
 import chromadb
 import numpy as np
 from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -26,9 +29,10 @@ from gpu_utils import DEVICE, print_gpu_status, clear_gpu_cache
 load_dotenv()
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-# UPDATE THESE TWO PATHS to match your local cache folder
-EMBED_MODEL  = r"C:\Users\Nitin Sharma\.cache\huggingface\hub\models--sentence-transformers--all-MiniLM-L6-v2\snapshots\8b3219a92973c328a8e22fadcfa821b5dc75636a"
-RERANK_MODEL = r"C:\Users\Nitin Sharma\.cache\huggingface\hub\models--cross-encoder--ms-marco-MiniLM-L-6-v2\snapshots\main"
+# Local MuRIL multilingual embedding model — handles Hindi/Marathi natively (no translation)
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+EMBED_MODEL  = os.path.join(_PROJECT_ROOT, "hf_models", "embedding_model")
+RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"   # downloaded from HF Hub on first use
 
 CHROMA_DIR      = "data/chromadb"
 COLLECTION      = "nyayasetu_legal"
@@ -58,15 +62,23 @@ class FIRComplaint(BaseModel):
 class NyayaSetuRAG:
 
     def __init__(self):
-        # Bi-encoder on GPU
+        # Bi-encoder on GPU (or CPU fallback)
         print(f"[RAG] Loading bi-encoder on {DEVICE}...")
-        self.embedder = SentenceTransformer(EMBED_MODEL, device=str(DEVICE))
-        print_gpu_status("bi-encoder loaded")
+        try:
+            self.embedder = SentenceTransformer(
+                EMBED_MODEL, device=str(DEVICE), local_files_only=True
+            )
+            print_gpu_status("bi-encoder loaded")
+        except Exception as _e:
+            print(f"[RAG] ⚠️  Local embedding model failed ({_e}). Falling back to all-MiniLM-L6-v2...")
+            self.embedder = SentenceTransformer("all-MiniLM-L6-v2", device=str(DEVICE))
+            print("[RAG] Fallback bi-encoder loaded.")
 
         # Cross-encoder on GPU
         print(f"[RAG] Loading cross-encoder on {DEVICE}...")
         import torch
-        torch.cuda.set_device(DEVICE)
+        if DEVICE.type == "cuda":
+            torch.cuda.set_device(DEVICE)
         self.reranker = CrossEncoder(RERANK_MODEL, max_length=512, device=str(DEVICE))
         print_gpu_status("cross-encoder loaded")
 

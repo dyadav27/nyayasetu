@@ -6,6 +6,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import json, time, uuid, random, string
+from typing import Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +14,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from twilio.rest import Client as TwilioClient
 
-from document_analyzer import analyze_document, DocumentRAG, fetch_case_laws
+from document_analyzer import analyze_document, DocumentRAG, fetch_case_laws, fetch_acts
 from lex_validator import (
     compute_compliance_score,
     generate_migration_message,
@@ -21,6 +22,21 @@ from lex_validator import (
 )
 from modules.m3_evidence.evidence import generate_evidence_certificate
 from legal_translator import translate_legal_text, translate_fir, get_supported_languages
+
+from sqlalchemy.orm import Session
+from fastapi import Depends
+import models
+from models import StatutoryAct
+from database import engine, get_db
+from auth import verify_password, get_password_hash, create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES, SECRET_KEY, ALGORITHM
+from datetime import timedelta
+from jose import JWTError, jwt
+from fastapi.security import OAuth2PasswordBearer
+
+# Create database tables
+models.Base.metadata.create_all(bind=engine)
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 load_dotenv()
 
@@ -88,6 +104,116 @@ class TranslateRequest(BaseModel):
     target_lang:   str = "en"
     document_type: str = "FIR / Police Complaint"
 
+class UserCreate(BaseModel):
+    email: str
+    password: str
+    full_name: str
+    phone: str = None
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class CaseCreate(BaseModel):
+    title: str
+    cnr_number: str = None
+    court_name: str = None
+    client_name: str = None
+    status: str = "Active"
+
+class CaseResponse(BaseModel):
+    id: int
+    title: str
+    cnr_number: str = None
+    court_name: str = None
+    client_name: str = None
+    status: str
+    
+    class Config:
+        from_attributes = True
+
+class TaskCreate(BaseModel):
+    title: str
+    description: str = None
+    due_date: str
+    case_id: int = None
+
+class TaskResponse(BaseModel):
+    id: int
+    title: str
+    description: str = None
+    due_date: str
+    is_completed: bool
+    case_id: int = None
+    
+    class Config:
+        from_attributes = True
+
+class HearingCreate(BaseModel):
+    case_id: int
+    hearing_date: str
+    purpose: str
+    notes: str = None
+
+class HearingResponse(BaseModel):
+    id: int
+    case_id: int
+    hearing_date: str
+    purpose: str
+    notes: str = None
+    
+    class Config:
+        from_attributes = True
+
+class InvoiceCreate(BaseModel):
+    client_name: str
+    amount: float
+    due_date: str
+
+class InvoiceResponse(BaseModel):
+    id: int
+    client_name: str
+    amount: float
+    status: str
+    due_date: str
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+class DocumentGenerateRequest(BaseModel):
+    doc_type: str # Rent Agreement, Legal Notice
+    party_a: str
+    party_b: str
+    details: str
+
+class ResearchAskRequest(BaseModel):
+    query: str
+
+class ResearchCaseRequest(BaseModel):
+    query: str
+    court: str = "All Courts"
+    year_from: str = ""
+    year_to: str = ""
+    page: int = 0
+
+class ResearchSectionRequest(BaseModel):
+    sections: str
+    act: str
+    page: int = 0
+
+class ResearchActRequest(BaseModel):
+    act_name: str
+    jurisdiction: str = "Union of India"
+
+class ResearchActsListRequest(BaseModel):
+    jurisdiction: Optional[str] = None
+    category: Optional[str] = None
+    page: int = 0
+
+class CopilotRequest(BaseModel):
+    prompt: str
+    document_context: str = ""
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ENDPOINTS
@@ -102,6 +228,425 @@ def health():
         "sessions": len(doc_sessions),
     }
 
+# ── Authentication & Users ────────────────────────────────────────────────────
+@app.post("/api/auth/register")
+def register_user(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = db.query(models.User).filter(models.User.email == user.email).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    hashed_password = get_password_hash(user.password)
+    db_user = models.User(
+        email=user.email,
+        hashed_password=hashed_password,
+        full_name=user.full_name,
+        phone=user.phone
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return {"message": "User created successfully", "user_id": db_user.id}
+
+@app.post("/api/auth/login")
+def login(user: UserLogin, db: Session = Depends(get_db)):
+    db_user = db.query(models.User).filter(models.User.email == user.email).first()
+    if not db_user or not verify_password(user.password, db_user.hashed_password):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": db_user.email, "role": db_user.role, "id": db_user.id}, 
+        expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer", "user": {"id": db_user.id, "email": db_user.email, "full_name": db_user.full_name, "role": db_user.role}}
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = db.query(models.User).filter(models.User.email == email).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+@app.get("/api/auth/me")
+def read_users_me(current_user: models.User = Depends(get_current_user)):
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "full_name": current_user.full_name,
+        "role": current_user.role,
+        "phone": current_user.phone
+    }
+
+# ── Case Management ───────────────────────────────────────────────────────────
+@app.post("/api/cases", response_model=CaseResponse)
+def create_case(case: CaseCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    db_case = models.Case(
+        title=case.title,
+        cnr_number=case.cnr_number,
+        court_name=case.court_name,
+        client_name=case.client_name,
+        status=case.status,
+        lawyer_id=current_user.id
+    )
+    db.add(db_case)
+    db.commit()
+    db.refresh(db_case)
+    return db_case
+
+@app.get("/api/cases")
+def get_cases(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    if current_user.role == "admin":
+        cases = db.query(models.Case).all()
+    else:
+        cases = db.query(models.Case).filter(models.Case.lawyer_id == current_user.id).all()
+    return cases
+
+@app.get("/api/cases/{case_id}", response_model=CaseResponse)
+def get_case(case_id: int, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    case = db.query(models.Case).filter(models.Case.id == case_id).first()
+    if not case:
+        raise HTTPException(status_code=404, detail="Case not found")
+    if case.lawyer_id != current_user.id and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not authorized to view this case")
+    return case
+
+@app.get("/api/cnr/{cnr_number}")
+def fetch_mock_cnr(cnr_number: str):
+    """Mock endpoint to simulate E-Courts API data fetch based on CNR number."""
+    if len(cnr_number) < 16:
+        raise HTTPException(status_code=400, detail="Invalid CNR number format. Must be 16 characters.")
+    
+    # Mock data generation based on string to make it deterministic but varied
+    import random
+    random.seed(cnr_number)
+    
+    courts = ["Supreme Court of India", "Delhi High Court", "Bombay High Court", "District Court Saket"]
+    statuses = ["Active", "Pending Hearing", "Disposed", "Reserved for Orders"]
+    
+    return {
+        "cnr_number": cnr_number,
+        "title": f"State vs. Mock Person {random.randint(1, 100)}",
+        "court_name": random.choice(courts),
+        "status": random.choice(statuses),
+        "filing_date": f"2023-0{random.randint(1,9)}-{random.randint(10,28)}",
+        "next_hearing": f"2026-0{random.randint(6,9)}-{random.randint(10,28)}"
+    }
+
+# ── Tasks & Hearings ──────────────────────────────────────────────────────────
+@app.post("/api/tasks", response_model=TaskResponse)
+def create_task(task: TaskCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    from datetime import datetime
+    db_task = models.Task(
+        title=task.title,
+        description=task.description,
+        due_date=datetime.fromisoformat(task.due_date.replace("Z", "+00:00")),
+        case_id=task.case_id,
+        assignee_id=current_user.id
+    )
+    db.add(db_task)
+    db.commit()
+    db.refresh(db_task)
+    # Ensure datetime is formatted as string in response to match Pydantic schema easily
+    task_dict = db_task.__dict__.copy()
+    task_dict['due_date'] = str(db_task.due_date)
+    return task_dict
+
+@app.get("/api/tasks", response_model=list[TaskResponse])
+def get_tasks(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    tasks = db.query(models.Task).filter(models.Task.assignee_id == current_user.id).all()
+    res = []
+    for t in tasks:
+        td = t.__dict__.copy()
+        td['due_date'] = str(t.due_date)
+        res.append(td)
+    return res
+
+@app.post("/api/hearings", response_model=HearingResponse)
+def create_hearing(hearing: HearingCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    from datetime import datetime
+    # Ensure user has access to case
+    case = db.query(models.Case).filter(models.Case.id == hearing.case_id).first()
+    if not case or (case.lawyer_id != current_user.id and current_user.role != "admin"):
+        raise HTTPException(status_code=403, detail="Not authorized to add hearing to this case")
+        
+    db_hearing = models.Hearing(
+        case_id=hearing.case_id,
+        hearing_date=datetime.fromisoformat(hearing.hearing_date.replace("Z", "+00:00")),
+        purpose=hearing.purpose,
+        notes=hearing.notes
+    )
+    db.add(db_hearing)
+    db.commit()
+    db.refresh(db_hearing)
+    hd = db_hearing.__dict__.copy()
+    hd['hearing_date'] = str(db_hearing.hearing_date)
+    return hd
+
+@app.get("/api/hearings", response_model=list[HearingResponse])
+def get_hearings(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    # Get all cases for user
+    cases = db.query(models.Case).filter(models.Case.lawyer_id == current_user.id).all()
+    case_ids = [c.id for c in cases]
+    hearings = db.query(models.Hearing).filter(models.Hearing.case_id.in_(case_ids)).all()
+    res = []
+    for h in hearings:
+        hd = h.__dict__.copy()
+        hd['hearing_date'] = str(h.hearing_date)
+        res.append(hd)
+    return res
+
+# ── Firm Billing ──────────────────────────────────────────────────────────────
+@app.post("/api/invoices", response_model=InvoiceResponse)
+def create_invoice(inv: InvoiceCreate, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    from datetime import datetime
+    db_inv = models.Invoice(
+        lawyer_id=current_user.id,
+        client_name=inv.client_name,
+        amount=inv.amount,
+        due_date=datetime.fromisoformat(inv.due_date.replace("Z", "+00:00"))
+    )
+    db.add(db_inv)
+    db.commit()
+    db.refresh(db_inv)
+    inv_dict = db_inv.__dict__.copy()
+    inv_dict['due_date'] = str(db_inv.due_date)
+    inv_dict['created_at'] = str(db_inv.created_at)
+    return inv_dict
+
+@app.get("/api/invoices", response_model=list[InvoiceResponse])
+def get_invoices(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    if current_user.role == "admin":
+        invoices = db.query(models.Invoice).all()
+    else:
+        invoices = db.query(models.Invoice).filter(models.Invoice.lawyer_id == current_user.id).all()
+        
+    res = []
+    for inv in invoices:
+        inv_dict = inv.__dict__.copy()
+        inv_dict['due_date'] = str(inv.due_date)
+        inv_dict['created_at'] = str(inv.created_at)
+        res.append(inv_dict)
+    return res
+
+# ── Document Generator ────────────────────────────────────────────────────────
+@app.post("/api/generate_doc")
+def generate_document(req: DocumentGenerateRequest, current_user: models.User = Depends(get_current_user)):
+    """Generate legal documents via templates."""
+    if req.doc_type == "Rent Agreement":
+        content = f"""
+RENT AGREEMENT
+
+This Rent Agreement is made on this day between {req.party_a} (hereinafter referred to as the 'Landlord') 
+and {req.party_b} (hereinafter referred to as the 'Tenant').
+
+WHEREAS the Landlord is the absolute owner of the property and the Tenant has agreed to take the same on rent.
+
+DETAILS OF AGREEMENT:
+{req.details}
+
+1. The Tenant shall pay the agreed monthly rent in advance.
+2. The Tenant shall not sublet the property.
+3. The Agreement is subject to the jurisdiction of local courts.
+
+Signatures:
+_______________________ (Landlord: {req.party_a})
+_______________________ (Tenant: {req.party_b})
+"""
+    elif req.doc_type == "Legal Notice":
+        content = f"""
+LEGAL NOTICE
+
+To: {req.party_b}
+From: {req.party_a}
+
+Under instruction from my client {req.party_a}, I hereby issue this legal notice to you.
+
+SUBJECT: {req.details}
+
+You are hereby called upon to comply with the demands mentioned above within 15 days of receiving this notice, failing which my client shall be constrained to initiate legal proceedings against you entirely at your risk and cost.
+
+Signed,
+{current_user.full_name}, Advocate
+"""
+    else:
+        content = "Document type not supported."
+        
+    return {"doc_type": req.doc_type, "content": content}
+
+# ── Research Section (Real Endpoints) ─────────────────────────────────────────
+
+from document_analyzer import call_llm, fetch_case_laws, parse_json_response
+
+@app.post("/api/research/ask")
+def research_ask(req: ResearchAskRequest):
+    # Fetch real case precedents from Indian Kanoon first
+    cases = fetch_case_laws(req.query, "Legal Question")
+    
+    # Build a context string from the retrieved Kanoon judgments
+    context_str = ""
+    for idx, c in enumerate(cases):
+        context_str += f"[{idx+1}] Case: {c.get('title', 'Unknown')}\nSummary: {c.get('summary', '')}\n\n"
+
+    # Use Groq to synthesize an answer backed by these real Kanoon cases
+    prompt = f"""You are an expert Indian Legal Researcher. Provide a comprehensive, accurate, and easy-to-understand answer to the following legal question based on Indian law and the provided Supreme Court / High Court judgments.
+
+Structure your answer with these exact three headings:
+Applicable Law
+Application
+Conclusion
+
+QUESTION: {req.query}
+
+RELEVANT JUDGMENTS (Fetched from Indian Kanoon):
+{context_str if context_str.strip() else "No specific case laws found, answer based on general Indian legal principles."}
+
+Base your answer heavily on these specific judgments if provided. You MUST explicitly cite them in your text using their index number in brackets (e.g., [1], [2])."""
+    
+    response = call_llm(prompt, temperature=0.2)
+    return {"response": response, "citations": cases}
+
+@app.post("/api/research/cases")
+def research_cases(req: ResearchCaseRequest):
+    # If court or year filters are provided, we can append them to the query
+    search_query = req.query
+    if req.court and req.court != "All Courts":
+        search_query += f" {req.court}"
+    if req.year_from:
+        search_query += f" {req.year_from}"
+    
+    cases = fetch_case_laws(search_query, "Case Search", pagenum=req.page)
+    # fetch_case_laws returns a list of dicts: title, summary, url, court, year, related_section
+    # We map this to the format expected by the frontend
+    results = [
+        {
+            "title": c.get("title", "Untitled"),
+            "court": c.get("court", "Indian Court"),
+            "year": c.get("year", ""),
+            "snippet": c.get("summary", ""),
+            "url": c.get("url", "")
+        }
+        for c in cases
+    ]
+    return {"results": results}
+
+@app.post("/api/research/sections")
+def research_sections(req: ResearchSectionRequest):
+    search_query = f"Section {req.sections} of {req.act}"
+    cases = fetch_case_laws(search_query, "Section Search", pagenum=req.page)
+    results = [
+        {
+            "title": c.get("title", "Untitled"),
+            "court": c.get("court", "Indian Court"),
+            "year": c.get("year", ""),
+            "snippet": c.get("summary", ""),
+            "url": c.get("url", "")
+        }
+        for c in cases
+    ]
+    return {"results": results}
+
+@app.post("/api/research/acts")
+def research_acts(req: ResearchActsListRequest, db: Session = Depends(get_db)):
+    query = db.query(StatutoryAct)
+    
+    if req.jurisdiction:
+        query = query.filter(StatutoryAct.jurisdiction == req.jurisdiction)
+        
+    if req.category and req.category != "All":
+        query = query.filter(StatutoryAct.category.like(f"%{req.category}%"))
+        
+    acts = query.limit(50).all() # Return up to 50 acts at once from our database
+    
+    results = [
+        {
+            "name": a.title,
+            "year": a.year,
+            "snippet": a.summary,
+            "url": a.url
+        }
+        for a in acts
+    ]
+    return {"acts": results}
+
+@app.post("/api/research/act_summary")
+def research_act_summary(req: ResearchActRequest):
+    prompt = f"""You are an expert Indian Legal Assistant. Summarize the following statutory act.
+Act Name: {req.act_name}
+Jurisdiction: {req.jurisdiction}
+
+Return a JSON object strictly following this structure:
+{{
+  "purpose": "A paragraph explaining the objective, factual background, and purpose of the act.",
+  "key_provisions": "A paragraph detailing the most important sections and operational mechanisms of the act.",
+  "implications": "A paragraph explaining the legal implications, penalties, or overall impact of the act."
+}}
+Return ONLY valid JSON, without any markdown formatting like ```json or ```."""
+    
+    raw_response = call_llm(prompt, temperature=0.1)
+    data = parse_json_response(raw_response, fallback={
+        "purpose": "Failed to generate purpose.",
+        "key_provisions": "Could not parse key provisions.",
+        "implications": "Could not parse implications."
+    })
+    return data
+
+@app.post("/api/editor/copilot")
+def editor_copilot(req: CopilotRequest):
+    if not os.getenv("GEMINI_API_KEY"):
+        return {"reply": "API Key missing. Cannot connect to copilot."}
+        
+    try:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        
+        system_prompt = """You are an elite legal drafting AI Copilot, acting as a Senior Partner at a top-tier Indian law firm. 
+Your primary job is to generate top-notch, watertight, and highly professional legal clauses, pleadings, and correspondence.
+Follow these strict rules:
+1. ALWAYS default to Indian Law (e.g., BNSS, BNS, BSA, CPC, Indian Contract Act) and Indian jurisdictions (e.g., Mumbai, Delhi) unless specified otherwise.
+2. Use precise, formal, and authoritative legal terminology standard in Indian High Courts and the Supreme Court.
+3. If asked to draft a clause, provide ONLY the drafted clause itself, ready to be inserted directly into the document. DO NOT include conversational filler like 'Here is a draft...' or 'Would you like to customize this...'.
+4. Ensure all drafting is unambiguous, comprehensive, and protects the client's interests.
+5. Provide plain text output without markdown formatting (no **, ##, etc.) to ensure seamless pasting into a rich text editor."""
+        
+        full_prompt = f"User Request: {req.prompt}\n\nCurrent Document Context (use this to match party names, tone, and subject matter if applicable):\n{req.document_context[:2000]}\n\nDraft exactly what is requested based on the rules above."
+        
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=full_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.3,
+            ),
+        )
+        return {"reply": response.text}
+    except Exception as e:
+        print(f"Copilot Error: {e}")
+        return {"reply": "Sorry, I encountered an error while generating the text."}
+
+@app.get("/api/research/topics")
+def research_topics():
+    return {
+        "topics": [
+            {"name": "Constitutional & Administrative", "count": 6},
+            {"name": "Criminal Law", "count": 6},
+            {"name": "Civil & Property", "count": 8},
+            {"name": "Corporate & Commercial", "count": 6},
+            {"name": "Tax Laws", "count": 8},
+            {"name": "Labour & Service", "count": 2}
+        ]
+    }
 
 # ── Document analysis ─────────────────────────────────────────────────────────
 @app.post("/api/analyze")

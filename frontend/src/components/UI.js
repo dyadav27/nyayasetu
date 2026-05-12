@@ -62,6 +62,8 @@ export const ICONS = {
   search:   [<circle key="a" cx="11" cy="11" r="8"/>,<line key="b" x1="21" y1="21" x2="16.65" y2="16.65"/>],
   sun:      [<circle key="a" cx="12" cy="12" r="5"/>,...[0,45,90,135,180,225,270,315].map((a,i)=>{const r=a*Math.PI/180;return <line key={i} x1={12+7*Math.sin(r)} y1={12-7*Math.cos(r)} x2={12+9*Math.sin(r)} y2={12-9*Math.cos(r)}/>;})],
   moon:     "M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z",
+  grid:     [<rect key="a" x="3" y="3" width="7" height="7"/>, <rect key="b" x="14" y="3" width="7" height="7"/>, <rect key="c" x="14" y="14" width="7" height="7"/>, <rect key="d" x="3" y="14" width="7" height="7"/>],
+  book:     [<path key="a" d="M4 19.5A2.5 2.5 0 016.5 17H20"/>,<path key="b" d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/>],
   menu:     [<line key="a" x1="3" y1="6" x2="21" y2="6"/>,<line key="b" x1="3" y1="12" x2="21" y2="12"/>,<line key="c" x1="3" y1="18" x2="21" y2="18"/>],
   x:        [<line key="a" x1="18" y1="6" x2="6" y2="18"/>,<line key="b" x1="6" y1="6" x2="18" y2="18"/>],
   upload:   [<polyline key="a" points="16,16 12,12 8,16"/>,<line key="b" x1="12" y1="12" x2="12" y2="21"/>,<path key="c" d="M20.39 18.39A5 5 0 0018 9h-1.26A8 8 0 103 16.3"/>],
